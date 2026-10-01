@@ -69,18 +69,21 @@ func (s *Scheduler) dispatchOnce(ctx context.Context) (int, error) {
 	var (
 		batch    []candidate
 		unplaced []*QueuedJob
+		scanned  int
 	)
-	for len(batch) < s.cfg.MaxDispatchBatch {
+	for len(batch) < s.cfg.MaxDispatchBatch && scanned < s.cfg.MaxDispatchScan {
 		qj := s.queue.PopBest(now)
 		if qj == nil {
 			break
 		}
+		scanned++
 		idx, ok := s.cfg.Policy.Select(qj.Request, s.fleet)
 		if !ok {
-			// Leave the job queued and look at the next one. This is bounded
-			// backfill: a job too large for the current cluster must not stop
-			// smaller jobs behind it from running, but we also do not scan the
-			// whole queue looking for something that fits.
+			// Leave the job queued and look at the next one. This is the
+			// backfill window: a job too large for the current cluster must
+			// not stop smaller jobs behind it from running, but scanning the
+			// whole queue every sweep to discover that nothing fits costs more
+			// than waiting for the next one.
 			unplaced = append(unplaced, qj)
 			continue
 		}

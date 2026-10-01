@@ -100,6 +100,12 @@ type Config struct {
 	// MaxDispatchBatch is how many placements are committed in one transaction.
 	// Batching amortizes the fsync that makes each assignment durable.
 	MaxDispatchBatch int
+	// MaxDispatchScan bounds how far down the queue one sweep looks for
+	// something that fits. This is the backfill window: a job too large for the
+	// current cluster must not block smaller jobs behind it, but scanning a
+	// hundred thousand queued jobs every 25ms to discover that nothing fits is
+	// worse than waiting for the next sweep.
+	MaxDispatchScan int
 	// MaxLeaseSweep bounds how many expired leases one reconcile pass reclaims.
 	MaxLeaseSweep int
 
@@ -130,6 +136,7 @@ func DefaultConfig() Config {
 		DispatchInterval:  25 * time.Millisecond,
 		ReconcileInterval: 250 * time.Millisecond,
 		MaxDispatchBatch:  256,
+		MaxDispatchScan:   2048,
 		MaxLeaseSweep:     512,
 		RetryBaseDelay:    250 * time.Millisecond,
 		RetryMaxDelay:     30 * time.Second,
@@ -165,6 +172,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxDispatchBatch <= 0 {
 		c.MaxDispatchBatch = d.MaxDispatchBatch
+	}
+	if c.MaxDispatchScan <= 0 {
+		c.MaxDispatchScan = d.MaxDispatchScan
+	}
+	if c.MaxDispatchScan < c.MaxDispatchBatch {
+		c.MaxDispatchScan = c.MaxDispatchBatch
 	}
 	if c.MaxLeaseSweep <= 0 {
 		c.MaxLeaseSweep = d.MaxLeaseSweep
@@ -401,8 +414,13 @@ func (s *Scheduler) Recover(ctx context.Context) error {
 		s.addWorkerLocked(w, running[w.ID])
 	}
 	s.queue = NewReadyQueue(s.cfg.Queue)
+	restored := make([]*QueuedJob, 0, len(queued))
 	for _, j := range queued {
-		s.queue.Push(queuedJobFrom(j))
+		restored = append(restored, queuedJobFrom(j))
+	}
+	sortByEnqueuedAt(restored)
+	for _, qj := range restored {
+		s.queue.Push(qj)
 	}
 	queueLen := s.queue.Len()
 	s.mu.Unlock()

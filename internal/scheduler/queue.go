@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"container/list"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -145,11 +146,12 @@ func (q *ReadyQueue) Push(j *QueuedJob) {
 
 // pushReady inserts a job into its bucket, keeping the bucket sorted by enqueue
 // time. Sorted insertion is what makes "the bucket head is the bucket's best job"
-// true for every ordering that uses buckets, and the common case — a job enqueued
-// now, which is newer than everything already queued — is a single append.
+// true for every ordering that uses buckets.
 //
-// Out-of-order pushes are not hypothetical: recovery and the periodic resync load
-// rows from the database in whatever order the query returns them.
+// The scan walks backwards from the newest entry, so a job enqueued now — which is
+// every job in steady state — is a single append. A job older than everything
+// already queued costs a walk of the whole bucket, which is why callers that load
+// jobs from the database sort them by enqueue time first (see sortByEnqueuedAt).
 func (q *ReadyQueue) pushReady(j *QueuedJob) {
 	if q.ordering == OrderEDF {
 		heap.Push(q.edf, j)
@@ -364,4 +366,13 @@ func (h *delayHeap) Pop() any {
 	j.heapIndex = -1
 	*h = old[:n-1]
 	return j
+}
+
+// sortByEnqueuedAt orders jobs oldest first.
+//
+// Callers that rebuild the queue from database rows must use it. Pushing a batch of
+// jobs newest-first would make every insert walk its whole bucket, turning a restart
+// with a deep queue into quadratic work.
+func sortByEnqueuedAt(jobs []*QueuedJob) {
+	sort.Slice(jobs, func(i, j int) bool { return jobs[i].EnqueuedAt.Before(jobs[j].EnqueuedAt) })
 }

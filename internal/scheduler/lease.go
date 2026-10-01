@@ -89,14 +89,18 @@ func (s *Scheduler) resyncQueue(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
-	restored := 0
+	missing := make([]*QueuedJob, 0, len(queued))
 	s.mu.Lock()
 	for _, j := range queued {
 		if !s.queue.Contains(j.ID) {
-			s.queue.Push(queuedJobFrom(j))
-			restored++
+			missing = append(missing, queuedJobFrom(j))
 		}
 	}
+	sortByEnqueuedAt(missing)
+	for _, qj := range missing {
+		s.queue.Push(qj)
+	}
+	restored := len(missing)
 	s.mu.Unlock()
 	if restored > 0 {
 		s.signalDispatch()
