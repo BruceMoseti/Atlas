@@ -4,11 +4,20 @@ BIN           := bin
 PROTOC        ?= protoc
 PKG           := github.com/BruceMoseti/Atlas
 
+# The generated protobuf code is committed, and CI fails if regenerating it
+# produces a diff. That check is only meaningful if the toolchain is pinned:
+# the generated files record the versions that produced them, so an unpinned
+# protoc would make the check fail whenever a CI runner image changed.
+# PROTOC_VERSION is the protobuf release tag; it yields libprotoc 3.21.12.
+PROTOC_VERSION      := 21.12
+PROTOC_GEN_GO       := v1.34.2
+PROTOC_GEN_GO_GRPC  := v1.4.0
+
 export GOTOOLCHAIN
 
 .PHONY: all build test test-race test-integration test-all lint fmt vet proto clean demo \
         chaos chaos-campaign bench bench-policy bench-scale bench-overload \
-        bench-fragmentation experiments figures tools help
+        bench-fragmentation experiments figures tools help print-protoc-version
 
 ## help: list the available targets
 help:
@@ -59,9 +68,10 @@ proto:
 		--go-grpc_out=. --go-grpc_opt=module=$(PKG) \
 		proto/atlas.proto
 
+## tools: install the pinned protoc plugins into $(GOPATH)/bin
 tools:
-	$(GO) install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
-	$(GO) install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.4.0
+	$(GO) install google.golang.org/protobuf/cmd/protoc-gen-go@$(PROTOC_GEN_GO)
+	$(GO) install google.golang.org/grpc/cmd/protoc-gen-go-grpc@$(PROTOC_GEN_GO_GRPC)
 
 ## chaos: a short randomized fault-injection campaign against real processes
 chaos: build
@@ -112,3 +122,7 @@ bench:
 ## clean: remove build output and chaos working directories
 clean:
 	rm -rf $(BIN) results/chaos-*/ *.db *.db-wal *.db-shm
+
+# Lets CI read the pin from one place instead of duplicating the version.
+print-protoc-version:
+	@echo $(PROTOC_VERSION)
