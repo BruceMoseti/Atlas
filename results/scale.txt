@@ -1,0 +1,65 @@
+Atlas simulator
+  run at       2026-10-01T03:25:13Z
+  host         cursor
+  go           go1.22.2
+  os/arch      linux/amd64
+  cpus         8
+  memory       47.1GiB
+
+Experiment 5 - placement decision cost versus fleet size
+========================================================
+
+Policy.Select is called directly against a synthetic fleet; no queue, no
+event loop, no database. 200000 decisions per row.
+
+WORKERS  SCENARIO                POLICY        MEAN      P50       P99       DECISIONS/SEC
+10       idle, small job         round-robin   35ns      35ns      42ns      11465969
+10       idle, small job         least-loaded  54ns      52ns      61ns      9415742
+10       idle, small job         best-fit      52ns      52ns      60ns      9773951
+10       busy, small job         round-robin   35ns      35ns      43ns      11145632
+10       busy, small job         least-loaded  53ns      52ns      65ns      9728191
+10       busy, small job         best-fit      54ns      53ns      65ns      9522324
+10       busy, job fits nowhere  round-robin   55ns      55ns      66ns      9480141
+10       busy, job fits nowhere  least-loaded  36ns      36ns      43ns      11328216
+10       busy, job fits nowhere  best-fit      37ns      36ns      44ns      11332179
+100      idle, small job         round-robin   36ns      35ns      41ns      11637060
+100      idle, small job         least-loaded  238ns     234ns     269ns     3466624
+100      idle, small job         best-fit      245ns     242ns     281ns     3353224
+100      busy, small job         round-robin   34ns      35ns      38ns      11852525
+100      busy, small job         least-loaded  237ns     234ns     268ns     3479584
+100      busy, small job         best-fit      243ns     241ns     275ns     3413899
+100      busy, job fits nowhere  round-robin   285ns     280ns     319ns     2980148
+100      busy, job fits nowhere  least-loaded  126ns     128ns     152ns     5671019
+100      busy, job fits nowhere  best-fit      115ns     112ns     140ns     6042674
+1000     idle, small job         round-robin   35ns      35ns      42ns      11765144
+1000     idle, small job         least-loaded  2.09µs    2.063µs   2.388µs   465997
+1000     idle, small job         best-fit      2.169µs   2.145µs   2.47µs    449382
+1000     busy, small job         round-robin   36ns      35ns      40ns      11633507
+1000     busy, small job         least-loaded  2.122µs   2.083µs   2.638µs   458994
+1000     busy, small job         best-fit      2.181µs   2.144µs   2.705µs   446964
+1000     busy, job fits nowhere  round-robin   2.565µs   2.535µs   3.074µs   381516
+1000     busy, job fits nowhere  least-loaded  1.029µs   1.038µs   1.257µs   921758
+1000     busy, job fits nowhere  best-fit      844ns     832ns     1.038µs   1111453
+10000    idle, small job         round-robin   35ns      35ns      40ns      11835140
+10000    idle, small job         least-loaded  21.069µs  20.556µs  36.186µs  47317
+10000    idle, small job         best-fit      21.541µs  21.291µs  25.865µs  46279
+10000    busy, small job         round-robin   35ns      35ns      39ns      11465680
+10000    busy, small job         least-loaded  20.858µs  20.587µs  25.724µs  47794
+10000    busy, small job         best-fit      21.944µs  21.291µs  40.659µs  45435
+10000    busy, job fits nowhere  round-robin   25.274µs  25.032µs  29.012µs  39458
+10000    busy, job fits nowhere  least-loaded  9.182µs   8.412µs   11.496µs  108136
+10000    busy, job fits nowhere  best-fit      8.101µs   7.969µs   10.86µs   122317
+
+Three things to read out of this table.
+
+Least-loaded and best-fit are strictly linear in fleet size: they score every
+worker before choosing, so their cost tracks worker count and nothing else.
+
+Round-robin's cost depends entirely on how soon it finds a worker that fits.
+When one does, it is flat regardless of fleet size. When none does, it scans
+everything and becomes the most expensive policy in the table.
+
+The 'fits nowhere' rows are cheaper per worker for the scoring policies than
+the rows where placement succeeds, because a worker that fails the fit check
+is never scored. The expensive case for a scoring policy is a successful
+placement, not a failed one.

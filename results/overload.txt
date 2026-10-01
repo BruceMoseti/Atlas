@@ -1,0 +1,31 @@
+Atlas simulator
+  run at       2026-10-01T03:25:42Z
+  host         cursor
+  go           go1.22.2
+  os/arch      linux/amd64
+  cpus         8
+  memory       47.1GiB
+
+Experiment 4 - overload, with and without admission control
+===========================================================
+
+20 workers: 20 x uniform (16 cpu, 32GiB mem)
+workload: 20000 jobs of 2 cpu / 4GiB, runtime exp(mean=10s)
+sustainable throughput is about 16 jobs/sec, so rates above that are overload
+
+ARRIVAL/S  ADMISSION   ACCEPTED  REJECTED  PEAK QUEUE  MEAN WAIT  P99 WAIT  CPU UTIL
+8          none        20000     0         1           0ms        0ms       50.3%
+8          queue<=500  20000     0         1           0ms        0ms       50.3%
+16         none        20000     0         548         20.57s     33.45s    96.5%
+16         queue<=500  19961     39        500         19.66s     31.31s    96.5%
+32         none        20000     0         10178       5.3m       10.5m     97.1%
+32         queue<=500  10296     9704      500         29.60s     34.71s    95.0%
+64         none        20000     0         14946       7.8m       15.6m     97.2%
+64         queue<=500  5525      14475     500         28.61s     33.70s    90.0%
+128        none        20000     0         17451       9.1m       18.1m     97.3%
+128        queue<=500  3109      16891     500         26.69s     33.28s    81.0%
+
+Without admission control an overloaded cluster still accepts everything, and
+the cost lands on wait time, which the caller cannot see until it is already
+enormous. With a bounded queue the same overload produces an immediate
+RESOURCE_EXHAUSTED, which the caller can act on.

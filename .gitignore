@@ -5,4 +5,7 @@
 *.db-shm
 /data/
 /tmp/
-/results/
+
+# Chaos campaigns create a working directory per run, holding the database and
+# child process logs. The reports themselves are evidence and are committed.
+/results/chaos-*/
