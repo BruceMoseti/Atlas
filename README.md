@@ -48,34 +48,78 @@ database after every test run, and gated in CI under randomized `SIGKILL`,
 | **Scheduler decisions in 21 µs at 10,000 workers** | ~47,000 placements/sec on one core; measured across 10 → 10,000 machines, 200,000 decisions per data point |
 | **Flat queue pops at 100,000 queued jobs** | 159 ns at depth 100, 166 ns at depth 100,000 — a bucketed-deque design that a heap cannot match under priority aging |
 | **Counts its own duplicate executions** | 16 observed in the flagship campaign, published rather than hidden, because that is what at-least-once honestly means |
-| **Verified, not asserted** | 105 tests — 79 unit, 26 integration against real gRPC/SQLite/worker processes — plus an invariant checker with its own failure tests. All race-clean in CI. |
+| **Verified, not asserted** | 107 tests — 81 unit, 26 integration against real gRPC/SQLite/worker processes — plus an invariant checker with its own failure tests. All race-clean in CI. |
 
 ---
 
 ## Demo
 
-Submit a job and watch it through the state machine:
+### Submit a job
 
 ```console
 $ atlas submit --cpu 1 --memory 256m --wait -- echo "hello atlas"
-job_738743db435dd3cb    QUEUED
+job_2895543ec029fe67    QUEUED
 QUEUED
 SUCCEEDED
 
-job              job_738743db435dd3cb
+job              job_2895543ec029fe67
 state            SUCCEEDED
+idempotency key  auto_b56d1e26233bdf38
+client           cli
+priority         0
 request          1 cpu, 256MiB memory
+command          echo hello atlas
 attempts         1 of 3
 exit code        0
+created          204ms ago
 
-#  ATTEMPT ID            WORKER    STATE      EXIT  DURATION  MESSAGE
-1  att_7cab8056ca732af3  worker-a  SUCCEEDED  0     4ms
+#  ATTEMPT ID            WORKER  STATE      EXIT  FAILURE  DURATION  MESSAGE
+1  att_a589ae225e8610a4  w2      SUCCEEDED  0     -        2ms
 
---- attempt 1 (att_7cab8056ca732af3) output ---
+--- attempt 1 (att_a589ae225e8610a4) output ---
 hello atlas
 ```
 
-Then break the cluster on purpose and check that it still obeyed its own rules:
+### Kill the machine running it — `./scripts/demo.sh`
+
+A self-contained script: two real workers, a 30-second job, a real `SIGKILL`, and
+no client involvement in the recovery. Runs in about 13 seconds. This is the actual
+captured output.
+
+```console
+==> Submitting a 30-second job that occupies a whole worker
+job id: job_2386f7a33135ea5b
+
+state            RUNNING
+attempts         1 of 3
+
+#  ATTEMPT ID            WORKER  STATE    EXIT  DURATION  MESSAGE
+1  att_3efdddcf8e3b7367  w2      RUNNING  -     7ms
+
+==> Killing worker w2 with SIGKILL — no warning, no cleanup
+worker w2 is gone
+
+==> The scheduler notices, reclaims the lease, and retries elsewhere
+
+state            RUNNING
+attempts         2 of 3
+failure class    WORKER_LOST
+message          worker w2 declared dead after 3.049s without a heartbeat
+
+#  ATTEMPT ID            WORKER  STATE    EXIT  DURATION  MESSAGE
+1  att_3efdddcf8e3b7367  w2      LOST     -     3.038s
+2  att_c8f3177f3f023aa8  w1      RUNNING  -     260ms
+
+==> Idempotent submission: the same key returns the same job, never a second one
+$ atlas submit --cpu 2 --memory 4GB --idempotency-key demo-recovery -- sleep 30
+job_2386f7a33135ea5b    RUNNING    (deduplicated: idempotency key already used)
+```
+
+Attempt 1 is `LOST`, not `FAILED` — the distinction is deliberate. `FAILED` means
+Atlas knows the execution finished badly; `LOST` means Atlas does not know what
+happened, and the two are retried under different policies.
+
+### Break it on purpose and check it still obeyed its own rules
 
 ```console
 $ atlas-chaos --workers 10 --jobs 3000 --duration 150s --restart-scheduler \
@@ -112,7 +156,8 @@ Invariants (docs/SEMANTICS.md §7), checked against 24484 audited state changes
 VERDICT: PASS - every documented invariant held under fault injection
 ```
 
-The full report is committed at [`results/chaos-campaign.txt`](results/chaos-campaign.txt).
+The full report is committed at [`results/chaos-campaign.txt`](results/chaos-campaign.txt),
+and the same campaign runs in CI on every pull request.
 
 ---
 
@@ -657,6 +702,35 @@ aging you actually get.
 
 ---
 
+## Engineering concepts, and where they live in the code
+
+A map for anyone who wants to check a specific claim rather than take the prose on
+trust.
+
+| Concept | Where | Specifically |
+| --- | --- | --- |
+| **Failure detection** | `scheduler/lease.go` | Two-stage heartbeat ageing (`HEALTHY → SUSPECT → DEAD`) with separate thresholds, plus independent lease expiry for faults heartbeats cannot observe |
+| **Leases / fencing tokens** | `scheduler/worker_api.go` | Attempt-scoped authority; `validateRef` rejects any mutation from a caller that no longer owns the attempt — the same reasoning as a fencing token on a distributed lock |
+| **At-least-once semantics** | `docs/SEMANTICS.md` | The guarantee stated formally, the reason exactly-once is impossible here, and the duplicate count published rather than hidden |
+| **Idempotency** | `scheduler/jobs.go`, `worker_api.go` | Submission keyed on a client token with a spec hash to catch key reuse; every worker RPC safely replayable after a lost response |
+| **ACID transactions & durability** | `store/store.go` | `Update(func(*Tx) error)` composes multi-row writes atomically; WAL + `synchronous=FULL`; a job is acknowledged only after `fsync` |
+| **Invariant specification & checking** | `internal/invariants` | Nine properties stated formally and verified mechanically against the durable record — including an append-only audit log, so "terminal states are absorbing" is checked over the whole history |
+| **Concurrency & lock discipline** | `scheduler/scheduler.go`, `dispatch.go` | One mutex never held across I/O, documented lock ordering, a capacity-1 wakeup channel that collapses event bursts into one sweep; race-detector clean including integration tests |
+| **Optimistic concurrency** | `scheduler/dispatch.go` | Placement decided against a cached fleet view, then re-validated inside the transaction — the cache can be wrong without ever being dangerous |
+| **Data structures** | `scheduler/queue.go` | Per-priority deques giving O(distinct priorities) pop under continuously-changing keys, a binary heap for EDF where monotonicity fails, a separate delay heap for retry backoff |
+| **Algorithmic complexity, measured** | `scheduler/bench_test.go` | Pop cost flat from depth 100 to 100,000; placement cost linear in fleet size and quantified, which is the argument for *not* optimizing it |
+| **Discrete-event simulation** | `simulator/` | Virtual-clock event loop over a priority queue of events, driving the real scheduler components at fleet sizes a single machine cannot run |
+| **Probability & queueing** | `simulator/workload.go` | Poisson arrivals (exponential interarrival times), heavy-tailed bimodal service times, offered load normalized against a computed sustainable throughput bound |
+| **Tail-latency analysis** | `simulator/simulator.go` | p50/p95/p99/max wait and turnaround, time-weighted utilization integrals, and a fragmentation metric normalized against time-under-demand |
+| **Backpressure & flow control** | `scheduler/admission.go` | Bounded queue, per-client quotas, and rejection of jobs no machine could ever run — with the measured cost of omitting it |
+| **Exponential backoff with jitter** | `scheduler/lease.go` | Full jitter (`rand(0, min(base·2ⁿ, max))`), because the failure that caused the retry usually hit many jobs at once |
+| **RPC & schema design** | `proto/atlas.proto` | Two services split by audience; domain errors mapped to gRPC codes that tell a caller what to *do*; long-poll assignment delivery |
+| **Process & resource isolation** | `worker/executor.go` | Linux process groups so a killed job takes its children with it; Docker executor with kernel-enforced CPU and memory limits |
+| **Observability** | `internal/metrics`, `api/health.go` | 20 Prometheus metrics, liveness separated from readiness, structured event logs carrying job/attempt/worker/lease ids, alert rules mapped to the failure model |
+| **Crash recovery** | `scheduler/scheduler.go` | State rebuilt from the store, allocation recomputed from live attempts, lapsed leases reclaimed, accrued priority preserved across the restart |
+
+---
+
 ## Tech stack
 
 | | |
@@ -703,9 +777,15 @@ proto/atlas.proto          service + message definitions (generated code committ
 simulator/                 discrete-event model reusing the real queue and policies
 chaos/                     campaign orchestration + invariant report
 tests/                     integration suite (build tag: integration)
+
+scripts/
+├── demo.sh                scripted worker-kill recovery against real processes
+└── plot_results.py        regenerates docs/images/ by parsing results/*.txt
+
 deployments/               Dockerfile, docker-compose, Prometheus config + alert rules
 docs/                      SEMANTICS · ARCHITECTURE · FAILURE_MODEL · BENCHMARKING · RESULTS
 results/                   committed raw output from the experiments the docs cite
+.github/workflows/ci.yml   lint · race tests · integration · chaos gate · proto drift
 ```
 
 `internal/scheduler` does not import protobuf — which is why the simulator can drive
@@ -802,11 +882,12 @@ The test strategy maps to what each layer can actually prove.
 | Unit — core packages | 68 | `make test` | Every state-machine edge exhaustively; queue orderings and aging; fit and each policy; backoff bounds and jitter; store transactionality and rollback; executor exit-code classification and process-group kill |
 | ├ of which, invariant checker | 11 | `go test ./internal/invariants/...` | Each invariant, against a database constructed to violate exactly that one |
 | Unit — simulator model | 11 | `go test ./simulator/...` | Determinism under a seed, job conservation, no oversubscription in the model, failure path wired up |
+| Unit — CLI argument handling | 2 | `go test ./cmd/...` | Flag reordering, so `atlas cancel JOB --reason x` cannot silently drop the reason |
 | **Integration** | **26** | `make test-integration` | Real gRPC over TCP, real SQLite on disk, real worker processes running real commands — then killed |
 | Chaos | — | `make chaos` | Randomized `SIGKILL`/`SIGSTOP`/restarts against real processes; exits non-zero on any invariant violation |
 | Benchmarks | 3 | `make bench` | Placement decision cost and queue operations |
 
-**105 tests total**, all race-clean in CI.
+**107 tests total**, all race-clean in CI.
 
 ```bash
 make test-race          # everything above, race detector clean (~25s)

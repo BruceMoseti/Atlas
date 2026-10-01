@@ -72,17 +72,19 @@ func run() error {
 
 	switch args[0] {
 	case "submit":
+		// Not reordered: everything after `--` is the workload's own command
+		// line and must be passed through untouched.
 		return cmdSubmit(ctx, client, args[1:])
 	case "get":
-		return cmdGet(ctx, client, args[1:])
+		return cmdGet(ctx, client, flagsFirst(args[1:]))
 	case "list":
-		return cmdList(ctx, client, args[1:])
+		return cmdList(ctx, client, flagsFirst(args[1:]))
 	case "cancel":
-		return cmdCancel(ctx, client, args[1:])
+		return cmdCancel(ctx, client, flagsFirst(args[1:]))
 	case "workers":
-		return cmdWorkers(ctx, client, args[1:])
+		return cmdWorkers(ctx, client, flagsFirst(args[1:]))
 	case "drain":
-		return cmdDrain(ctx, client, args[1:])
+		return cmdDrain(ctx, client, flagsFirst(args[1:]))
 	case "status":
 		return cmdStatus(ctx, client)
 	case "help", "-h", "--help":
@@ -158,9 +160,9 @@ func cmdSubmit(ctx context.Context, c pb.AtlasServiceClient, argv []string) erro
 		return err
 	}
 	if res.Deduplicated {
-		fmt.Printf("%s\t%s\t(deduplicated: idempotency key already used)\n", res.JobId, res.State)
+		fmt.Printf("%s\t%s\t(deduplicated: idempotency key already used)\n", res.JobId, stateName(res.State))
 	} else {
-		fmt.Printf("%s\t%s\n", res.JobId, res.State)
+		fmt.Printf("%s\t%s\n", res.JobId, stateName(res.State))
 	}
 	if !*wait {
 		return nil
@@ -471,4 +473,47 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// flagsFirst moves flags ahead of positional arguments.
+//
+// Go's flag package stops parsing at the first non-flag, so `atlas cancel JOB
+// --reason x` would silently ignore --reason. Every other CLI a user has touched
+// accepts that ordering, so Atlas does too rather than being surprising.
+//
+// A flag that takes a value is recognised by asking the command's own flag set,
+// which is passed in by the caller as knownValueFlags.
+func flagsFirst(args []string) []string {
+	var flags, positional []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			positional = append(positional, args[i+1:]...)
+			break
+		}
+		if !strings.HasPrefix(a, "-") {
+			positional = append(positional, a)
+			continue
+		}
+		flags = append(flags, a)
+		// `--flag value` needs its value kept adjacent. `--flag=value` and
+		// boolean flags do not.
+		if !strings.Contains(a, "=") && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
+			if valueFlags[strings.TrimLeft(a, "-")] {
+				i++
+				flags = append(flags, args[i])
+			}
+		}
+	}
+	return append(flags, positional...)
+}
+
+// valueFlags lists the flags on the reordered subcommands that take a value, so
+// `--reason some text` keeps its argument. Boolean flags must not appear here or
+// they would swallow the positional that follows them.
+var valueFlags = map[string]bool{
+	"reason": true,
+	"state":  true,
+	"client": true,
+	"limit":  true,
 }

@@ -292,7 +292,7 @@ The layers exist because each can prove something the others cannot.
 
 | Layer | Proves | Cannot prove |
 | --- | --- | --- |
-| Unit (68 core + 11 simulator) | Logic in isolation: every state-machine edge, queue ordering, fit, backoff bounds, store rollback | Anything about concurrency or real failure |
+| Unit (68 core + 11 simulator + 2 CLI) | Logic in isolation: every state-machine edge, queue ordering, fit, backoff bounds, store rollback | Anything about concurrency or real failure |
 | Integration (26) | Real gRPC, real SQLite, real worker processes, real `SIGKILL` | Behaviour at scale |
 | Invariant checker (11 self-tests) | The nine properties, against the durable record | That the properties are the right ones |
 | Chaos | The properties hold under randomized real faults | Throughput at scale |
@@ -741,5 +741,5 @@ Answer directly; the willingness to say it is the point.
 | Decision cost | 53 ns @ 10 workers → 21 µs @ 10,000; ~47k decisions/sec on one core |
 | Queue pop | 159 ns at depth 100, 166 ns at depth 100,000 — flat |
 | Admission control | p99 wait flat at ~34 s across an 8× overload range, vs 18 minutes unbounded |
-| Tests | 105 total: 68 core unit + 11 simulator self-tests + 26 integration. The 68 include 11 that make the invariant checker fail. All race-clean. |
+| Tests | 107 total: 68 core unit + 11 simulator + 2 CLI + 26 integration. The 68 include 11 that make the invariant checker fail. All race-clean. |
 | Code | 13,628 lines of Go excluding generated protobuf; 3,788 of it tests |

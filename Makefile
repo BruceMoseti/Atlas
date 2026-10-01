@@ -6,7 +6,7 @@ PKG           := github.com/BruceMoseti/Atlas
 
 export GOTOOLCHAIN
 
-.PHONY: all build test test-race test-integration test-all lint fmt vet proto clean \
+.PHONY: all build test test-race test-integration test-all lint fmt vet proto clean demo \
         chaos chaos-campaign bench bench-policy bench-scale bench-overload \
         bench-fragmentation experiments figures tools help
 
@@ -26,11 +26,15 @@ build:
 
 ## test: unit tests
 test:
-	$(GO) test ./internal/... ./simulator/...
+	$(GO) test ./internal/... ./simulator/... ./cmd/...
 
 ## test-race: unit tests under the race detector
 test-race:
-	$(GO) test -race ./internal/... ./simulator/...
+	$(GO) test -race ./internal/... ./simulator/... ./cmd/...
+
+## demo: a scripted worker-kill recovery demonstration against real processes
+demo: build
+	./scripts/demo.sh
 
 ## test-integration: end-to-end tests, including worker and scheduler kills
 test-integration: build
