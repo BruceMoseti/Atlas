@@ -84,9 +84,12 @@ func (s *Scheduler) dispatchOnce(ctx context.Context) (int, error) {
 			unplaced = append(unplaced, qj)
 			continue
 		}
+		// Reserve against the cached view so the rest of this batch does not
+		// place work on capacity we have already spoken for. Running is not
+		// touched here: it counts committed attempts, and a gauge that briefly
+		// reports work that may never be assigned is worse than useless.
 		view := s.fleet[idx]
 		view.Available = view.Available.Sub(qj.Request)
-		view.Running++
 		batch = append(batch, candidate{job: qj, workerID: view.ID, reserved: qj.Request})
 	}
 	s.queue.Requeue(unplaced)
@@ -110,7 +113,6 @@ func (s *Scheduler) dispatchOnce(ctx context.Context) (int, error) {
 	for _, c := range batch {
 		if ws, ok := s.workers[c.workerID]; ok {
 			ws.view.Available = ws.view.Available.Add(c.reserved)
-			ws.view.Running--
 		}
 	}
 	if err != nil {

@@ -74,6 +74,31 @@ func (c *Config) applyDefaults() error {
 type execution struct {
 	assignment scheduler.Assignment
 	cancel     context.CancelFunc
+
+	mu sync.Mutex
+	// abandonAs records why the worker tore this execution down, so the report
+	// says what actually happened.
+	//
+	// The distinction matters: an execution killed because the worker is
+	// shutting down or has lost its lease is WORKER_LOST, which is retryable
+	// somewhere else. Only an execution the scheduler told us to stop is
+	// CANCELED, which is terminal. Reporting the second for the first would
+	// permanently fail every job on a worker that restarts.
+	abandonAs state.FailureClass
+}
+
+func (e *execution) setAbandonClass(c state.FailureClass) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.abandonAs == "" {
+		e.abandonAs = c
+	}
+}
+
+func (e *execution) abandonClass() state.FailureClass {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.abandonAs
 }
 
 // Worker is the agent. One Worker owns one connection to the scheduler and runs
@@ -123,10 +148,10 @@ func (w *Worker) Run(ctx context.Context) error {
 	}
 	w.wg.Wait()
 
-	// Cancelling the executions releases their processes. Their leases will
-	// expire and the scheduler will retry them elsewhere; a worker shutting down
-	// cannot promise anything better under at-least-once semantics.
-	w.cancelAll("worker shutting down")
+	// Cancelling the executions releases their processes. They are reported as
+	// WORKER_LOST so the scheduler retries them elsewhere; a worker shutting
+	// down cannot promise anything better under at-least-once semantics.
+	w.cancelAll("worker shutting down", state.FailureWorkerLost)
 	return nil
 }
 
@@ -198,7 +223,7 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 			continue
 		}
 		for _, id := range res.CancelAttemptIds {
-			w.cancelAttempt(id, "scheduler reclaimed this attempt")
+			w.cancelAttempt(id, "scheduler reclaimed this attempt", state.FailureWorkerLost)
 		}
 	}
 }
@@ -267,7 +292,7 @@ func (w *Worker) renewLoop(ctx context.Context) {
 					// Our authority is gone. Killing the execution
 					// immediately is what keeps a reclaimed job from running
 					// twice for longer than it has to.
-					w.cancelAttempt(ex.assignment.AttemptID, "lease is no longer valid")
+					w.cancelAttempt(ex.assignment.AttemptID, "lease is no longer valid", state.FailureWorkerLost)
 					continue
 				}
 				w.log.Warn("renew_failed", "job_id", ex.assignment.JobID,
@@ -275,7 +300,7 @@ func (w *Worker) renewLoop(ctx context.Context) {
 				continue
 			}
 			if res.Canceled {
-				w.cancelAttempt(ex.assignment.AttemptID, "job canceled")
+				w.cancelAttempt(ex.assignment.AttemptID, "job canceled", state.FailureCanceled)
 			}
 		}
 	}
@@ -290,14 +315,15 @@ func (w *Worker) startExecution(ctx context.Context, a scheduler.Assignment) {
 		cancel()
 		return
 	}
-	w.active[a.AttemptID] = &execution{assignment: a, cancel: cancel}
+	ex := &execution{assignment: a, cancel: cancel}
+	w.active[a.AttemptID] = ex
 	w.mu.Unlock()
 
 	w.wg.Add(1)
 	go func() {
 		defer w.wg.Done()
 		defer cancel()
-		w.execute(ctx, execCtx, a)
+		w.execute(ctx, execCtx, ex)
 		w.mu.Lock()
 		delete(w.active, a.AttemptID)
 		w.mu.Unlock()
@@ -309,7 +335,8 @@ func (w *Worker) startExecution(ctx context.Context, a scheduler.Assignment) {
 // reportCtx is deliberately separate from execCtx: when an execution is canceled we
 // still want to tell the scheduler what happened, using a context that is not
 // already dead.
-func (w *Worker) execute(reportCtx, execCtx context.Context, a scheduler.Assignment) {
+func (w *Worker) execute(reportCtx, execCtx context.Context, ex *execution) {
+	a := ex.assignment
 	ref := w.ref(a)
 
 	if _, err := w.client.StartJob(reportCtx, &pb.StartJobRequest{Ref: ref}); err != nil {
@@ -331,6 +358,13 @@ func (w *Worker) execute(reportCtx, execCtx context.Context, a scheduler.Assignm
 	res, err := w.cfg.Executor.Run(execCtx, a)
 	if err != nil {
 		res = Result{FailureClass: state.FailureSystemError, Message: err.Error(), ExitCode: -1}
+	}
+	// The executor only knows its context was canceled, not why. The worker
+	// does, and the difference decides whether the job is retried.
+	if res.FailureClass == state.FailureCanceled {
+		if class := ex.abandonClass(); class != "" {
+			res.FailureClass = class
+		}
 	}
 
 	// Reporting must not inherit a canceled execution context, and must not hang
@@ -437,22 +471,24 @@ func (w *Worker) snapshotActive() []*execution {
 	return out
 }
 
-func (w *Worker) cancelAttempt(attemptID, reason string) {
+func (w *Worker) cancelAttempt(attemptID, reason string, class state.FailureClass) {
 	w.mu.Lock()
 	ex, ok := w.active[attemptID]
 	w.mu.Unlock()
 	if !ok {
 		return
 	}
-	w.log.Warn("execution_canceled", "attempt_id", attemptID,
-		"job_id", ex.assignment.JobID, "reason", reason)
+	ex.setAbandonClass(class)
+	w.log.Warn("execution_abandoned", "attempt_id", attemptID,
+		"job_id", ex.assignment.JobID, "reason", reason, "reported_as", string(class))
 	ex.cancel()
 }
 
-func (w *Worker) cancelAll(reason string) {
+func (w *Worker) cancelAll(reason string, class state.FailureClass) {
 	for _, ex := range w.snapshotActive() {
-		w.log.Warn("execution_canceled", "attempt_id", ex.assignment.AttemptID,
-			"job_id", ex.assignment.JobID, "reason", reason)
+		ex.setAbandonClass(class)
+		w.log.Warn("execution_abandoned", "attempt_id", ex.assignment.AttemptID,
+			"job_id", ex.assignment.JobID, "reason", reason, "reported_as", string(class))
 		ex.cancel()
 	}
 }

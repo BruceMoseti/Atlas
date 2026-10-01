@@ -38,6 +38,7 @@ import (
 type cluster struct {
 	t      *testing.T
 	dbPath string
+	cfg    scheduler.Config
 
 	store  *store.Store
 	sched  *scheduler.Scheduler
@@ -60,21 +61,9 @@ type testWorker struct {
 	done   chan struct{}
 }
 
-// startCluster brings up a scheduler on a random port.
+// startCluster brings up a scheduler on a random loopback port.
 func startCluster(t *testing.T, cfg scheduler.Config) *cluster {
 	t.Helper()
-	return startClusterAt(t, filepath.Join(t.TempDir(), "atlas.db"), cfg)
-}
-
-// startClusterAt reuses an existing database file, which is how the restart tests
-// bring a scheduler back onto the state its predecessor left behind.
-func startClusterAt(t *testing.T, dbPath string, cfg scheduler.Config) *cluster {
-	t.Helper()
-
-	st, err := store.Open(store.Options{Path: dbPath})
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
 
 	if cfg.Logger == nil {
 		cfg.Logger = logging.Discard()
@@ -82,19 +71,51 @@ func startClusterAt(t *testing.T, dbPath string, cfg scheduler.Config) *cluster 
 	if cfg.Metrics == nil {
 		cfg.Metrics = metrics.NewNop()
 	}
-	sched := scheduler.New(st, cfg)
+	c := &cluster{
+		t:       t,
+		dbPath:  filepath.Join(t.TempDir(), "atlas.db"),
+		cfg:     cfg,
+		addr:    "127.0.0.1:0",
+		workers: map[string]*testWorker{},
+	}
+	c.bringUpControlPlane()
+
+	conn, err := grpc.NewClient(c.addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	c.conn = conn
+	c.client = pb.NewAtlasServiceClient(conn)
+
+	t.Cleanup(c.stop)
+	return c
+}
+
+// bringUpControlPlane opens the database, starts a scheduler on it, and serves the
+// gRPC API at c.addr. After the first call, c.addr is a concrete host:port, so a
+// restart reuses the same socket and existing worker connections simply reconnect.
+func (c *cluster) bringUpControlPlane() {
+	c.t.Helper()
+
+	st, err := store.Open(store.Options{Path: c.dbPath})
+	if err != nil {
+		c.t.Fatalf("open store: %v", err)
+	}
+	sched := scheduler.New(st, c.cfg)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := sched.Start(ctx); err != nil {
 		cancel()
 		st.Close()
-		t.Fatalf("start scheduler: %v", err)
+		c.t.Fatalf("start scheduler: %v", err)
 	}
 
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	lis, err := net.Listen("tcp", c.addr)
 	if err != nil {
 		cancel()
-		t.Fatalf("listen: %v", err)
+		sched.Stop()
+		st.Close()
+		c.t.Fatalf("listen on %s: %v", c.addr, err)
 	}
 	srv := grpc.NewServer()
 	s := api.NewServer(sched)
@@ -102,21 +123,34 @@ func startClusterAt(t *testing.T, dbPath string, cfg scheduler.Config) *cluster 
 	pb.RegisterWorkerServiceServer(srv, s)
 	go func() { _ = srv.Serve(lis) }()
 
-	addr := lis.Addr().String()
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		cancel()
-		t.Fatalf("dial: %v", err)
-	}
+	c.store, c.sched, c.grpc, c.cancel = st, sched, srv, cancel
+	c.addr = lis.Addr().String()
+}
 
-	c := &cluster{
-		t: t, dbPath: dbPath, store: st, sched: sched, grpc: srv,
-		addr: addr, cancel: cancel, conn: conn,
-		client:  pb.NewAtlasServiceClient(conn),
-		workers: map[string]*testWorker{},
+// crashScheduler takes the control plane away without warning. Worker agents keep
+// running and keep trying; their RPCs just start failing, which is what they would
+// see if the scheduler's machine had gone down.
+func (c *cluster) crashScheduler() {
+	c.grpc.Stop()
+	c.cancel()
+	c.sched.Stop()
+	_ = c.store.Close()
+}
+
+// restartScheduler crashes the control plane, waits, and brings a fresh one up on
+// the same address and the same database. Worker agents run throughout, which is
+// what makes this a restart rather than a fresh cluster.
+//
+// during, if given, runs while the control plane is down and receives the database
+// path, for tests that need to disturb the durable state a crash left behind.
+func (c *cluster) restartScheduler(downtime time.Duration, during ...func(dbPath string)) {
+	c.t.Helper()
+	c.crashScheduler()
+	for _, fn := range during {
+		fn(c.dbPath)
 	}
-	t.Cleanup(c.stop)
-	return c
+	time.Sleep(downtime)
+	c.bringUpControlPlane()
 }
 
 // stop tears the cluster down the way a clean shutdown would.
@@ -135,19 +169,7 @@ func (c *cluster) stop() {
 		_ = w.conn.Close()
 	}
 	_ = c.conn.Close()
-	c.grpc.Stop()
-	c.cancel()
-	c.sched.Stop()
-	_ = c.store.Close()
-}
-
-// stopSchedulerOnly simulates losing the control plane while workers keep running.
-// The database file is left intact so a replacement scheduler can recover from it.
-func (c *cluster) stopSchedulerOnly() {
-	c.grpc.Stop()
-	c.cancel()
-	c.sched.Stop()
-	_ = c.store.Close()
+	c.crashScheduler()
 }
 
 // startWorker adds a worker agent to the fleet.
