@@ -803,22 +803,29 @@ container executor or Compose.)
 ```bash
 git clone https://github.com/BruceMoseti/Atlas.git
 cd Atlas
-make build          # produces ./bin/{atlas-server,atlas-worker,atlas,atlas-chaos,atlas-sim}
-make help           # list every target
+make build          # ./bin/{atlas-server,atlas-worker,atlas,atlas-chaos,atlas-sim}
+make help           # every target, with a one-line description
 ```
 
-### Run a local cluster
+### Fastest way to see it work — about 13 seconds
 
 ```bash
-# Terminal 1 — control plane
+make demo           # starts two workers, SIGKILLs the one running a job,
+                    # shows the job finish on the other one
+```
+
+### Run a local cluster yourself
+
+```bash
+# Control plane
 ./bin/atlas-server --db atlas.db --listen :50051 --http :9090
 
-# Terminal 2 — a deliberately heterogeneous fleet
+# A deliberately heterogeneous fleet, in another shell
 ./bin/atlas-worker --scheduler localhost:50051 --id w1 --cpu 8  --memory 16GB &
 ./bin/atlas-worker --scheduler localhost:50051 --id w2 --cpu 4  --memory 8GB  &
 ./bin/atlas-worker --scheduler localhost:50051 --id w3 --cpu 16 --memory 64GB &
 
-# Terminal 3 — client
+# Client
 ./bin/atlas submit --cpu 1 --memory 256m --wait -- echo "hello atlas"
 ./bin/atlas workers
 ./bin/atlas status
