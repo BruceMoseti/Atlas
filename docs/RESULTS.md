@@ -391,9 +391,12 @@ make build
 | --- | --- | --- |
 | `internal/state` | 6 | The transition table exhaustively, including that every non-terminal state can reach a terminal one |
 | `internal/store` | 11 | Transactionality, rollback, capacity enforcement, the audit log, idempotency uniqueness |
-| `internal/scheduler` | 20 | Queue orderings, aging, backfill ordering, fit, each policy, backoff bounds and jitter |
+| `internal/scheduler` | 23 | Queue orderings, aging, backfill ordering, fit, each policy, backoff bounds and jitter |
 | `internal/invariants` | 11 | Each invariant, against a database built to violate exactly that one |
-| `tests/` (integration) | 25 | Real gRPC, real SQLite, real worker processes: lifecycle, idempotency, cancellation, admission, draining, worker death, scheduler restart, stale attempts, forged leases, duplicate RPCs |
+| `internal/worker` | 12 | Output capture, exit-code classification, timeouts, process-group kill, and the identifiers a workload needs to be idempotent |
+| `internal/types` | 5 | Resource arithmetic and the size/CPU parsers |
+| `simulator/` | 11 | Determinism for a seed, job conservation, no oversubscription inside the model, and that the failure path is actually wired up |
+| `tests/` (integration) | 26 | Real gRPC, real SQLite, real worker processes: lifecycle, idempotency, cancellation, admission, draining, worker death, scheduler restart, stale attempts, forged leases, duplicate RPCs |
 
 All pass under `-race`. The integration suite takes about 33 seconds; with the race
 detector, about 42.

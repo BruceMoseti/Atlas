@@ -36,7 +36,7 @@ test-integration: build
 test-all: test-race test-integration
 
 fmt:
-	gofmt -w ./cmd ./internal ./simulator ./chaos ./tests ./benchmarks
+	gofmt -w ./cmd ./internal ./simulator ./chaos ./tests
 
 vet:
 	$(GO) vet ./...
@@ -86,7 +86,7 @@ experiments: bench-policy bench-scale bench-overload bench-fragmentation
 
 ## bench: Go microbenchmarks for the scheduler hot path
 bench:
-	$(GO) test -run '^$$' -bench . -benchmem ./internal/scheduler/... ./benchmarks/...
+	$(GO) test -run '^$$' -bench . -benchmem ./internal/scheduler/...
 
 clean:
 	rm -rf $(BIN) results *.db *.db-wal *.db-shm
