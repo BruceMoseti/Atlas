@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/BruceMoseti/Atlas/internal/state"
@@ -653,7 +654,7 @@ func (s *Scheduler) noteDuplicateExecution(ctx context.Context, ref AttemptRef, 
 		if err != nil {
 			return nil
 		}
-		a.Message = a.Message + " | late success reported after reclaim (duplicate execution)"
+		a.Message = strings.TrimSpace(a.Message + " | " + state.LateReportMarker)
 		return tx.SaveAttempt(a)
 	})
 }

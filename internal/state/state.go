@@ -162,6 +162,15 @@ const (
 // are unsure about them, and draining workers are excluded by operator intent.
 func (s WorkerState) Schedulable() bool { return s == WorkerHealthy }
 
+// LateReportMarker is appended to a reclaimed attempt's message when the worker
+// that held it reports success after the fact.
+//
+// That is a directly observed duplicate physical execution: Atlas requeued a job
+// whose earlier execution had in fact completed. The marker makes the count
+// recoverable from the durable record alone, so the chaos report can publish it
+// even across a scheduler restart that reset the in-memory counters.
+const LateReportMarker = "late-success-after-reclaim"
+
 // FailureClass categorizes why an attempt ended badly. The class drives the retry
 // decision, because "the program exited 1" and "we lost contact with the machine"
 // deserve different treatment.

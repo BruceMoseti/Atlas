@@ -56,6 +56,11 @@ type Report struct {
 	// Retries counts attempts beyond the first, i.e. physical executions caused
 	// by a retry.
 	Retries int
+	// DuplicateExecutions counts reclaimed attempts that later reported
+	// success. Each one is a logical job that definitely ran more than once,
+	// which at-least-once semantics permits and Atlas therefore measures
+	// rather than denies.
+	DuplicateExecutions int
 	// MaxAttemptsUsed is the largest attempt count on any single job.
 	MaxAttemptsUsed int32
 
@@ -87,6 +92,7 @@ func (r *Report) String() string {
 	fmt.Fprintf(&b, "  lost                %d\n", r.AttemptsLost)
 	fmt.Fprintf(&b, "  canceled            %d\n", r.AttemptsCanceled)
 	fmt.Fprintf(&b, "retries               %d (max attempts used on one job: %d)\n", r.Retries, r.MaxAttemptsUsed)
+	fmt.Fprintf(&b, "duplicate executions  %d\n", r.DuplicateExecutions)
 	fmt.Fprintf(&b, "workers               %d\n", r.WorkersTotal)
 	fmt.Fprintf(&b, "recorded transitions  %d\n", r.Transitions)
 	fmt.Fprintf(&b, "invariant violations  %d\n", len(r.Violations))
@@ -325,6 +331,9 @@ func checkAttempts(r *Report, attempts []*types.Attempt) {
 			r.AttemptsCanceled++
 		default:
 			r.AttemptsLive++
+		}
+		if a.State == state.AttemptLost && strings.Contains(a.Message, state.LateReportMarker) {
+			r.DuplicateExecutions++
 		}
 		if a.LeaseID == "" {
 			r.add("I3", a.ID, "attempt has no lease id")

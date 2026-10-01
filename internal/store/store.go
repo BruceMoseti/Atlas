@@ -746,6 +746,20 @@ func (t *Tx) DeleteWorker(id string) error {
 	return err
 }
 
+// ExecRawForTesting runs arbitrary SQL inside the transaction, bypassing the state
+// machine and the capacity checks.
+//
+// It exists for one purpose: the invariant checker's own tests need to construct
+// corruption that a correct scheduler cannot produce. A checker that has only ever
+// seen valid states is not evidence that it would catch an invalid one.
+func (t *Tx) ExecRawForTesting(query string, args ...any) error {
+	if !t.write {
+		return errors.New("store: ExecRawForTesting requires a write transaction")
+	}
+	_, err := t.tx.Exec(query, args...)
+	return err
+}
+
 func boolToInt(b bool) int {
 	if b {
 		return 1
