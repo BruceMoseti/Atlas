@@ -296,13 +296,13 @@ seed                      1
 wall clock                2m46s
 ```
 
-**Faults injected: 59**
+**Faults injected: 50**
 
 | Fault | Count |
 | --- | --- |
-| `SIGKILL` a worker (then restart it) | 31 |
-| `SIGSTOP` a worker for 1–4s, then `SIGCONT` | 23 |
-| `SIGKILL` the scheduler (then restart it) | 5 |
+| `SIGKILL` a worker (then restart it) | 24 |
+| `SIGSTOP` a worker for 1–4s, then `SIGCONT` | 17 |
+| `SIGKILL` the scheduler (then restart it) | 9 |
 
 Plus 20% of completion reports replayed, 10% of heartbeats dropped, and 5% of lease
 renewals dropped, throughout.
@@ -321,18 +321,18 @@ succeeded                 3,000
 failed after retry limit  0
 still pending             0
 
-attempts total            3,105
+attempts total            3,083
   succeeded               3,000
-  lost (lease reclaimed)  105
-retries                   105
-most attempts on one job  3
-duplicate executions      11
+  lost (lease reclaimed)  83
+retries                   83
+most attempts on one job  2
+duplicate executions      16
 
-recovery latency   p50 66ms   p99 143ms   max 198ms
+recovery latency   p50 64ms   p99 159ms   max 159ms
                    (excluding detection, bounded by the 4s dead-after
                     threshold or the 4s lease TTL)
 
-invariants checked against 24,626 audited state changes
+invariants checked against 24,484 audited state changes
   I1  terminal states were never left                      held
   I2  no worker was oversubscribed or went negative        held
   I3  allocation equals the sum of live attempts           held
@@ -349,11 +349,11 @@ VERDICT: PASS
 ### Reading this honestly
 
 **Logical jobs lost: 0.** Every one of the 3,000 jobs that was acknowledged to a
-client reached a terminal state, and every one of them succeeded, through 54 worker
-failures and 5 scheduler restarts.
+client reached a terminal state, and every one of them succeeded, through 41 worker
+failures and 9 scheduler restarts.
 
-**Duplicate executions: 11.** This is the number that matters most, and it is not
-zero. Eleven times, a worker had its lease reclaimed, the job was given to someone
+**Duplicate executions: 16.** This is the number that matters most, and it is not
+zero. Sixteen times, a worker had its lease reclaimed, the job was given to someone
 else, and the original worker then reported that it had in fact finished. Those
 jobs really did run twice. Atlas rejected the late reports — invariant I8 held, so
 none of them changed a job's outcome — but the work happened twice, and that is
@@ -365,13 +365,35 @@ worker that dies mid-job without ever reporting leaves no evidence of whether it
 work completed, and nothing can recover that evidence afterwards.
 
 **Recovery is fast once detected, and detection is the slow part.** The p99 from
-reclamation to reassignment is 143ms. The 4-second dead-after threshold dominates
-the end-to-end recovery time by a factor of about 30, which is the right place for
-the cost to be: it is the one parameter an operator tunes against their network.
+reclamation to reassignment is 159ms. The 4-second dead-after threshold dominates
+end-to-end recovery by a factor of about 25, which is the right place for the cost
+to be: it is the one parameter an operator tunes against their network.
 
-**105 retries from 54 worker faults.** Roughly two in-flight attempts per killed or
+**83 retries from 41 worker faults.** Roughly two in-flight attempts per killed or
 paused worker, with the fleet running 10 workers at 1.5-second jobs. No job needed
-more than 3 of its 10 attempts.
+more than 2 of its 10 attempts.
+
+### Chaos runs are not bit-reproducible, and should not be
+
+Unlike the simulator, a chaos campaign involves real processes on a real scheduler,
+so the seed fixes the *distribution* of faults rather than their exact timing.
+Two runs of the identical command differ:
+
+| | run A | run B |
+| --- | --- | --- |
+| worker kills / pauses / scheduler restarts | 31 / 23 / 5 | 24 / 17 / 9 |
+| attempts | 3,105 | 3,083 |
+| attempts lost | 105 | 83 |
+| duplicate executions | 11 | 16 |
+| recovery p99 | 143ms | 159ms |
+| jobs succeeded | 3,000 / 3,000 | 3,000 / 3,000 |
+| invariant violations | 0 | 0 |
+
+The fault counts and duplicate counts move by 30–50% between runs. The two rows
+that do not move are the two that are supposed to be properties rather than
+measurements: every job finished, and nothing violated an invariant. That is the
+right shape for this kind of test — if the invariant row varied, the invariants
+would not be invariants.
 
 Reproduce with:
 

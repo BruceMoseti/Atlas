@@ -5,8 +5,8 @@ Environment
   host                      cursor
   go / os / arch            go1.22.2 linux/amd64
   cpus                      8
-  started                   2026-10-01T03:27:47Z
-  wall clock                2m46s
+  started                   2026-10-01T03:41:53Z
+  wall clock                2m50s
 
 Configuration
   workers                   10
@@ -22,9 +22,9 @@ Configuration
   seed                      1
 
 Faults injected
-  kill-worker               31
-  pause-worker              23
-  restart-scheduler         5
+  kill-worker               24
+  pause-worker              17
+  restart-scheduler         9
 
 Submission
   submitted                 3000
@@ -41,26 +41,26 @@ Outcome
   canceled                  0
 
 Execution attempts
-  attempts total            3105
+  attempts total            3083
   succeeded                 3000
   failed                    0
-  lost (lease reclaimed)    105
+  lost (lease reclaimed)    83
   canceled                  0
-  retries                   105
-  most attempts on one job  3
-  duplicate executions      11  (reclaimed attempts that later
+  retries                   83
+  most attempts on one job  2
+  duplicate executions      16  (reclaimed attempts that later
                                 reported success: work that really did
                                 run twice, which at-least-once allows)
 
 Recovery latency (lease reclaimed to replacement attempt assigned)
-  p50                       66ms
-  p99                       143ms
-  max                       198ms
+  p50                       64ms
+  p99                       159ms
+  max                       159ms
   (excludes detection, which is bounded above by the 4s dead-after
    threshold for a worker that stops heartbeating, and by the 4s lease
    TTL for one that is alive but stops renewing)
 
-Invariants (docs/SEMANTICS.md §7), checked against 24626 audited state changes
+Invariants (docs/SEMANTICS.md §7), checked against 24484 audited state changes
   I1  terminal states were never left                      held
   I2  no worker was oversubscribed or went negative        held
   I3  allocation equals the sum of live attempts           held

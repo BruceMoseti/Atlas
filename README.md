@@ -30,25 +30,26 @@ hello atlas
 ```
 
 ```
-$ atlas-chaos --workers 8 --jobs 600 --duration 60s --restart-scheduler \
+$ atlas-chaos --workers 10 --jobs 3000 --duration 150s --restart-scheduler \
               --duplicate-rpc-rate 0.2 --heartbeat-drop-rate 0.1
 
 Faults injected
-  kill-worker               7
-  pause-worker              12
-  restart-scheduler         1
+  kill-worker               24
+  pause-worker              17
+  restart-scheduler         9
 
 Outcome
-  jobs in store             600
-  succeeded                 600
+  jobs in store             3000
+  succeeded                 3000
   failed after retry limit  0
 
 Execution attempts
-  attempts total            623
-  lost (lease reclaimed)    23
-  retries                   23
+  attempts total            3083
+  lost (lease reclaimed)    83
+  retries                   83
+  duplicate executions      16
 
-Invariants (docs/SEMANTICS.md §7), checked against 4934 audited state changes
+Invariants (docs/SEMANTICS.md §7), checked against 24484 audited state changes
   I1  terminal states were never left                      held
   I2  no worker was oversubscribed or went negative        held
   ...
@@ -388,6 +389,17 @@ best-fit are strictly linear: 53 ns at 10 workers, 240 ns at 100, 2.1 µs at 1,0
 21 µs at 10,000 — still ~47,000 decisions/sec on one core. Round-robin is flat at
 35 ns whenever *some* worker fits, and becomes the most expensive policy when none
 does.
+
+**The chaos campaign's most important number is not zero.** Across 50 injected
+faults, 3,000 of 3,000 jobs succeeded and all nine invariants held — but sixteen
+times a reclaimed worker reported afterwards that it had in fact finished its job.
+Those jobs really did run twice. Atlas rejected the late reports so none of them
+changed an outcome, and then published the count. A chaos report claiming zero
+duplicates under at-least-once semantics is either measuring nothing or lying.
+Chaos runs are deliberately not bit-reproducible: between two runs of the identical
+command the fault counts moved by 30–50%, while "every job finished" and "zero
+invariant violations" did not move at all. Those are the two rows that are supposed
+to be properties rather than measurements.
 
 ## Running it
 
