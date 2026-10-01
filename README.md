@@ -1,18 +1,64 @@
+<div align="center">
+
 # Atlas
 
-A fault-tolerant distributed compute scheduler: it accepts resource-constrained
-jobs, places them across a worker fleet, tracks every execution with a lease, and
-recovers automatically when machines, processes, or networks fail.
+**A fault-tolerant distributed compute scheduler in Go — resource-aware placement, attempt-scoped leases, and machine-checked correctness under randomized fault injection.**
 
-> **Atlas does not promise exactly-once execution.** It provides at-least-once
-> execution with attempt-scoped leases and idempotent control-plane operations. A
-> single job may run more than once; the system is built so that this is safe,
-> bounded, observable, and *measured* rather than denied.
-> See [`docs/SEMANTICS.md`](docs/SEMANTICS.md).
+[![CI](https://github.com/BruceMoseti/Atlas/actions/workflows/ci.yml/badge.svg)](https://github.com/BruceMoseti/Atlas/actions/workflows/ci.yml)
+[![Go 1.22](https://img.shields.io/badge/go-1.22-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-```
-$ atlas submit --cpu 1 --memory 256m -- echo "hello atlas"
-job_738743db435dd3cb    JOB_STATE_QUEUED
+[Highlights](#highlights) · [Demo](#demo) · [Architecture](#architecture) ·
+[Deep dive](#technical-deep-dive) · [Results](#results) ·
+[Decisions](#engineering-decisions) · [Run it](#getting-started) ·
+[Design notes](PROJECT_NOTES.md)
+
+</div>
+
+Atlas accepts jobs with CPU and memory requirements, places them across a fleet of
+worker machines, and keeps them running when the machines, processes, and network
+underneath them fail.
+
+**Why it exists.** Plenty of systems call themselves "fault tolerant" without saying
+which faults, how quickly they are detected, or what recovery costs. Atlas is an
+attempt at the opposite: state the guarantees precisely enough that they could be
+*proven wrong*, then build the machinery that tries to prove them wrong. The
+interesting constraint is one every job scheduler actually has to confront —
+**a distributed system cannot tell the difference between a worker that died before
+doing the work and a worker that died after doing it.**
+
+Atlas resolves that honestly. It provides **at-least-once execution** with
+attempt-scoped leases, idempotent control-plane operations, and a stale-write
+rejection path — and then it *measures* the duplicate executions that result
+instead of claiming there are none.
+
+Correctness is therefore not asserted in prose. Nine invariants are stated formally
+in [`docs/SEMANTICS.md`](docs/SEMANTICS.md), checked mechanically against the
+database after every test run, and gated in CI under randomized `SIGKILL`,
+`SIGSTOP`, scheduler restarts, and replayed RPCs.
+
+---
+
+## Highlights
+
+|  | |
+| --- | --- |
+| **Survives 50 injected faults with zero jobs lost** | 24 worker `SIGKILL`s, 17 `SIGSTOP` freezes, 9 scheduler restarts, 20% of RPCs replayed — 3,000/3,000 jobs completed, all 9 invariants held across **24,484 audited state transitions** |
+| **4.5× lower mean queue wait** from the placement policy | Least-loaded vs round-robin at 90% offered load, on an identical workload and seed; p99 wait 93s vs 5.4m |
+| **Scheduler decisions in 21 µs at 10,000 workers** | ~47,000 placements/sec on one core; measured across 10 → 10,000 machines, 200,000 decisions per data point |
+| **Flat queue pops at 100,000 queued jobs** | 159 ns at depth 100, 166 ns at depth 100,000 — a bucketed-deque design that a heap cannot match under priority aging |
+| **Counts its own duplicate executions** | 16 observed in the flagship campaign, published rather than hidden, because that is what at-least-once honestly means |
+| **Verified, not asserted** | 105 tests — 79 unit, 26 integration against real gRPC/SQLite/worker processes — plus an invariant checker with its own failure tests. All race-clean in CI. |
+
+---
+
+## Demo
+
+Submit a job and watch it through the state machine:
+
+```console
+$ atlas submit --cpu 1 --memory 256m --wait -- echo "hello atlas"
+job_738743db435dd3cb    QUEUED
 QUEUED
 SUCCEEDED
 
@@ -29,433 +75,836 @@ exit code        0
 hello atlas
 ```
 
-```
+Then break the cluster on purpose and check that it still obeyed its own rules:
+
+```console
 $ atlas-chaos --workers 10 --jobs 3000 --duration 150s --restart-scheduler \
               --duplicate-rpc-rate 0.2 --heartbeat-drop-rate 0.1
 
 Faults injected
-  kill-worker               24
-  pause-worker              17
-  restart-scheduler         9
+  kill-worker               24     # SIGKILL, no warning, no cleanup
+  pause-worker              17     # SIGSTOP: alive, holding leases, answering nothing
+  restart-scheduler          9     # the control plane itself
 
 Outcome
-  jobs in store             3000
-  succeeded                 3000
-  failed after retry limit  0
+  jobs in store           3000
+  succeeded               3000
+  failed after retry limit   0
 
 Execution attempts
-  attempts total            3083
+  attempts total          3083
   lost (lease reclaimed)    83
-  retries                   83
-  duplicate executions      16
+  duplicate executions      16     # work that really did run twice
+
+Recovery latency          p50 64ms   p99 159ms
 
 Invariants (docs/SEMANTICS.md §7), checked against 24484 audited state changes
   I1  terminal states were never left                      held
   I2  no worker was oversubscribed or went negative        held
-  ...
+  I3  allocation equals the sum of live attempts           held
+  I4  at most one live attempt per job                     held
+  I5  attempt counts stayed within budget                  held
+  I6  every accepted job is still in the store             held
+  I7  idempotency keys are unique                          held
+  I8  no stale attempt decided a job's outcome             held
   I9  job and attempt states agree                         held
 
 VERDICT: PASS - every documented invariant held under fault injection
 ```
 
-## Contents
+The full report is committed at [`results/chaos-campaign.txt`](results/chaos-campaign.txt).
 
-- [Architecture](#architecture)
-- [Execution semantics](#execution-semantics)
-- [Job state machine](#job-state-machine)
-- [Scheduling and the resource model](#scheduling-and-the-resource-model)
-- [Leases and failure recovery](#leases-and-failure-recovery)
-- [Persistence](#persistence)
-- [Idempotency](#idempotency)
-- [Backpressure](#backpressure)
-- [Observability](#observability)
-- [Chaos testing](#chaos-testing)
-- [Results](#results)
-- [Running it](#running-it)
-- [Limitations](#limitations)
+---
 
-## Architecture
+## The problem, concretely
 
-```
-   CLI ──gRPC──▶  ┌─────────── CONTROL PLANE (one atlas-server) ───────────┐
-                  │  API: admission, idempotency, error mapping            │
-                  │  Dispatch loop: policy, backfill window, batched commit│
-                  │  Reconcile loop: lease expiry, worker health, resync   │
-                  │  SQLite (WAL, synchronous=FULL)                        │
-                  │    jobs · attempts · workers · transitions (audit log) │
-                  └───────────────────▲───────────────────────────────────-┘
-                                      │ workers always dial in
-                  ┌───────────────────┴────────────────┐
-           ┌──────────────┐                   ┌──────────────┐
-           │ atlas-worker │                   │ atlas-worker │
-           │   8 CPU      │                   │   4 CPU      │
-           │   16 GiB     │                   │   8 GiB      │
-           └──────┬───────┘                   └──────┬───────┘
-                  ▼                                  ▼
-          process / container               process / container
-```
+A worker finishes a job and dies before telling the scheduler. The scheduler's
+lease on that work expires. At that instant it holds exactly one fact: *it has not
+received a completion.* It cannot distinguish:
 
-Two directions matter. **Every connection is opened by a worker**, so the scheduler
-never dials out and workers need no inbound reachability. **The scheduler still owns
-placement** — workers long-poll for assignments the dispatcher has already decided
-on and already committed, which keeps the placement policy centralized and
-comparable instead of being an emergent property of who polled first.
+- the work never happened, or
+- the work happened and the acknowledgement was lost.
 
-Full detail, including the concurrency model and where the in-memory caches can
-drift: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Any system claiming exactly-once execution here is either committing the result in
+the same transaction as the side effect — impossible when the side effect is an
+arbitrary user process — or is wrong.
 
-## Execution semantics
-
-The guarantee and its justification are in [`docs/SEMANTICS.md`](docs/SEMANTICS.md),
-which was written before the scheduler was.
-
-The short version. Consider a worker that finishes a job and then dies before the
-scheduler hears about it. At the moment the lease expires, the scheduler holds
-exactly one fact: it has not received a completion. It cannot distinguish "the work
-never happened" from "the work happened and the acknowledgement was lost". Any
-system claiming otherwise is either doing the commit inside the same transaction as
-the side effect — which Atlas cannot, because the side effect is an arbitrary user
-process — or is wrong.
-
-So Atlas retries, and says that it retries. What it provides instead:
+So Atlas retries, says that it retries, and builds the machinery that makes
+retrying safe:
 
 | Property | Guarantee |
 | --- | --- |
 | Job submission | Idempotent, keyed by a client-supplied `idempotency_key` |
 | Job execution | At-least-once, bounded by `max_attempts` |
-| Control-plane state | Serializable, in a single SQLite database with one writer |
-| Attempt authority | At most one attempt per job holds a valid lease at any time |
+| Control-plane state | Serializable, single SQLite writer, `synchronous=FULL` |
+| Attempt authority | At most one attempt per job holds a valid lease at any instant |
 | Stale results | A result from a non-current attempt can never mutate job state |
 | Durability | A job acknowledged to a client survives scheduler restart |
 | Completion reporting | Idempotent; a replay returns the recorded outcome |
 
 Every execution receives `ATLAS_JOB_ID` (stable across retries) and
-`ATLAS_ATTEMPT_ID` (unique per physical execution) in its environment, so a workload
-with external side effects has what it needs to make them idempotent.
+`ATLAS_ATTEMPT_ID` (unique per physical execution), so a workload with external
+side effects has what it needs to deduplicate them itself.
 
-## Job state machine
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+    CLI["<b>atlas CLI</b><br/>or any gRPC client"]
+
+    subgraph CP["CONTROL PLANE — one atlas-server process"]
+        API["<b>gRPC API</b><br/>admission control<br/>idempotent submission<br/>stale-write rejection"]
+        DISP["<b>Dispatch loop</b><br/>placement policy<br/>backfill window<br/>batched commit"]
+        REC["<b>Reconcile loop</b> · 250 ms<br/>lease expiry<br/>worker health ageing<br/>queue resync"]
+        DB[("<b>SQLite</b> · WAL · synchronous=FULL<br/>single writer + read pool<br/><br/>jobs · attempts · workers<br/>transitions <i>(audit log)</i>")]
+
+        API -- "admit → QUEUED" --> DISP
+        DISP -- "attempt + lease + capacity<br/><i>one fsync per batch</i>" --> DB
+        REC -- "reclaim lapsed leases → requeue" --> DB
+    end
+
+    subgraph EP["EXECUTION PLANE — heterogeneous fleet"]
+        W1["<b>atlas-worker</b><br/>8 CPU · 16 GiB<br/><i>process executor</i>"]
+        W2["<b>atlas-worker</b><br/>4 CPU · 8 GiB<br/><i>process executor</i>"]
+        W3["<b>atlas-worker</b><br/>16 CPU · 64 GiB<br/><i>docker executor</i>"]
+    end
+
+    OBS["<b>Observability</b><br/>Prometheus /metrics<br/>/live · /ready<br/>gRPC health"]
+
+    CLI == "submit · get · cancel · drain" ==> API
+    DISP == "committed assignments" ==> EP
+    EP -. "workers always dial in — the scheduler never dials out" .-> API
+    API -.-> OBS
+
+    classDef plane fill:#f6f8fa,stroke:#8fa0b0,stroke-width:1.5px
+    classDef store fill:#fff6e5,stroke:#cf9f52,stroke-width:1.5px
+    classDef obs fill:#f2f7f2,stroke:#86a886,stroke-width:1.5px
+    class CP,EP plane
+    class DB store
+    class OBS obs
+```
+
+Two directions in that diagram are load-bearing design decisions:
+
+**Every connection is opened by a worker.** The scheduler never dials out. Workers
+need no inbound reachability, the control plane needs no service discovery, and a
+worker that cannot reach the scheduler simply loses its leases rather than entering
+a half-connected state.
+
+**The scheduler still owns placement.** Workers long-poll, but for assignments the
+dispatcher already decided on and already committed. Letting workers pick their own
+work would make the placement policy an emergent property of whoever polled first —
+and would make the policy comparison below meaningless.
+
+### The lease lifecycle, including the case that makes it hard
+
+This is the whole system in one picture: a job is placed, the worker holding it
+dies, the lease is reclaimed, the job is retried elsewhere — and then the original
+worker comes back and reports that it had finished all along.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as Client
+    participant S as Scheduler
+    participant DB as SQLite
+    participant A as Worker A
+    participant B as Worker B
+
+    C->>S: SubmitJob(idempotency_key, 2 cpu, 4 GiB)
+    S->>DB: BEGIN · dedup · admit · INSERT job · SUBMITTED→QUEUED · COMMIT
+    S-->>C: job_42, QUEUED
+
+    rect rgb(243, 247, 251)
+    Note over S,A: Placement — decided by the scheduler, collected by the worker
+    S->>DB: BEGIN · attempt_1 + lease_L1 · job→ASSIGNED · reserve 2 cpu · COMMIT
+    A->>S: AcquireJob (long poll)
+    S-->>A: assignment(job_42, attempt_1, lease_L1)
+    A->>S: StartJob(job_42, attempt_1, lease_L1)
+    A->>S: RenewLease ... every LeaseTTL/4
+    end
+
+    rect rgb(253, 244, 240)
+    Note over A,S: Worker A's machine dies mid-execution
+    A--xS: heartbeats and renewals stop
+    S->>S: SuspectAfter → SUSPECT (no new work, keeps what it has)
+    S->>S: DeadAfter → DEAD
+    S->>DB: BEGIN · attempt_1 → LOST · release 2 cpu · job → QUEUED · COMMIT
+    end
+
+    rect rgb(243, 247, 251)
+    Note over S,B: Retry on a different worker
+    S->>DB: BEGIN · attempt_2 + lease_L2 · reserve on B · COMMIT
+    B->>S: AcquireJob → StartJob(attempt_2, lease_L2)
+    B->>S: CompleteJob(attempt_2, lease_L2, exit 0)
+    S->>DB: attempt_2 → SUCCEEDED · job → SUCCEEDED · release
+    end
+
+    rect rgb(253, 240, 240)
+    Note over A,S: Worker A comes back — it finished the job too
+    A->>S: CompleteJob(job_42, attempt_1, lease_L1, exit 0)
+    S->>S: attempt_1 is LOST, not the job's current attempt
+    S-->>A: FAILED_PRECONDITION — stale attempt, kill it
+    S->>DB: record duplicate execution (observed, counted, published)
+    end
+
+    C->>S: GetJob(job_42)
+    S-->>C: SUCCEEDED · 2 attempts · decided by attempt_2
+```
+
+Step 17 is the one that matters. Worker A is telling the truth: it really did
+complete the job. Accepting that report would overwrite an outcome decided by
+worker B, so it is rejected (step 19) — and recorded as a duplicate execution
+(step 20), because the work genuinely ran twice and pretending otherwise would be
+the dishonest option.
+
+---
+
+## How it works
+
+### Submitting a job
 
 ```
-                       SUBMITTED
-                           │
-                           ▼
-            ┌──────────▶ QUEUED ◀──────────────────┐
-            │              │                       │
-            │              ▼                       │
-   retry    │          ASSIGNED                    │  lease expired,
-   with     │              │                       │  worker declared dead,
-   backoff  │              ▼                       │  or attempt lost
-            │           RUNNING ───────────────────┘
-            │            ╱ │ ╲
-            │           ╱  │  ╲
-            └──── SUCCEEDED FAILED CANCELED      (terminal, all three)
+client ──SubmitJob(idempotency_key, cpu, memory, …)──▶ API
+                                                        │
+                                                 BEGIN TRANSACTION
+                                                   look up idempotency_key ──▶ found? return the same job
+                                                   admission checks (queue depth, client quota, could-ever-fit)
+                                                   INSERT job as SUBMITTED
+                                                   validate SUBMITTED → QUEUED
+                                                 COMMIT + fsync
+                                                        │
+                                                 push to in-memory queue, wake dispatcher
+                                                        ▼
+client ◀────────────── job_id, QUEUED ──────────────────┘
 ```
 
-Every transition goes through `internal/state`, which rejects illegal edges and
-appends to an audit table. Nothing in the codebase assigns a state directly. That is
-what makes "terminal states are absorbing" checkable over an entire run rather than
-only at its end.
+Deduplication runs **before** admission control, deliberately. A client retrying a
+submission it is unsure about must get the same answer it would have got the first
+time, even if the queue filled up in between. Rejecting the retry would leave the
+client believing the job does not exist when it does.
 
-Attempts have their own state machine, and `LOST` is deliberately distinct from
-`FAILED`: `FAILED` means Atlas knows the execution finished badly, `LOST` means
-Atlas does not know what happened. They are retried under different policies.
+### Placing a job
 
-## Scheduling and the resource model
+```
+dispatcher wakes (submission · completion · worker registered · 25 ms tick)
+  │
+  ├─ promote jobs whose retry backoff elapsed
+  │
+  ├─ build a batch, up to 256 placements or 2048 candidates scanned:
+  │     pop the best job from the ready queue
+  │     ask the policy for a worker
+  │     reserve optimistically against the cached view
+  │     (nothing fits? leave it queued, try the next job — the backfill window)
+  │
+  └─ ONE transaction for the whole batch:
+        for each placement, re-read the job and worker and re-check:
+          job still QUEUED?   worker still schedulable?   does it still fit?
+          INSERT attempt (ASSIGNED, lease_id, expires_at)
+          job QUEUED → ASSIGNED, attempt_count++
+          worker.allocated += request        ← transaction FAILS if this oversubscribes
+        COMMIT  (one fsync for the whole batch)
+  │
+  ├─ overwrite cached worker views from the committed rows
+  └─ deliver assignments to each worker's mailbox
+```
 
-Jobs declare CPU in millicores and memory in bytes. A worker fits a job only if both
-dimensions fit and the worker is `HEALTHY` and not draining.
+Batching is not a micro-optimization. Every assignment must be durable before a
+worker is told about it, and durability costs one `fsync`. Committing N placements
+together turns N fsyncs into one.
 
-**Placement policies** (`--policy`):
+The re-validation inside the transaction is what makes the in-memory cache safe:
+the policy chooses using a snapshot that may be stale, and the transaction decides
+using rows that are not. A stale cache costs a wasted decision and nothing else.
 
-- `round-robin` — the deliberately stupid baseline, and a useful control
-- `least-loaded` — the worker with the most free capacity, averaged across both
-  dimensions
-- `best-fit` — the worker with the least capacity left over afterwards
+### Executing and reporting
 
-**Queue orderings** (`--ordering`):
+```
+worker ──AcquireJob (long poll)──▶  committed assignments for this worker
+worker ──StartJob(job, attempt, lease)──▶  attempt ASSIGNED → RUNNING
+worker     …runs the workload in its own process group…
+worker ──RenewLease(…)──▶  every LeaseTTL/4, extending expires_at
+worker ──CompleteJob(…)──▶  attempt → SUCCEEDED, job → SUCCEEDED, capacity released
+```
 
-- `fifo` — oldest first, priority ignored
-- `priority` — strict priority, which can starve low-priority work indefinitely
-- `priority-aging` — effective priority is `base + rate × wait`, capped
-- `edf` — earliest deadline first
+Every worker RPC carries `(job_id, attempt_id, lease_id)`. That is the whole
+stale-write defence, explained below.
 
-The queue is a map of per-priority deques sorted by enqueue time, not one heap, and
-that choice is load-bearing. For FIFO, strict priority, and aging, the best job in a
-bucket is always the bucket's oldest, so the global best is found by comparing
-bucket heads — O(distinct priorities), independent of queue depth. A heap cannot do
-this because aging changes every key continuously. Measured: pop cost is flat at
-~160–210 ns from depth 100 to depth 100,000.
+---
 
-A sweep that cannot place a job moves on to the next one rather than blocking behind
-it, up to `--dispatch-scan` candidates. That backfill window is explicit because
-scanning a hundred thousand queued jobs every 25 ms to discover nothing fits is
-worse than waiting for the next sweep.
+## Technical deep dive
 
-## Leases and failure recovery
+<details open>
+<summary><b>Leases vs heartbeats — two detectors, because they answer different questions</b></summary>
 
-A lease is not a heartbeat, and the distinction is the heart of the design.
+<br/>
 
 - A **heartbeat** answers: *is this worker process alive?*
 - A **lease** answers: *does this worker currently hold authority to execute this
   specific attempt?*
 
-Those are different questions. A worker can be alive and heartbeating while making
-no progress on one job. A worker can be healthy but partitioned in one direction.
+Those are not the same question. A worker can be alive and heartbeating while
+making no progress on one job — its executor wedged, its disk full, one goroutine
+deadlocked. A worker can be healthy but partitioned in exactly one direction.
 
 ```
 HEALTHY ──missed 3 heartbeats──▶ SUSPECT ──sustained silence──▶ DEAD
    ▲                                │                             │
-   └─────── a heartbeat ────────────┘                             ▼
-                                              every attempt on it reclaimed at once
+   └──────── a heartbeat ───────────┘                             ▼
+                                             every attempt on it reclaimed at once
 
 attempt assigned ──▶ renewed every LeaseTTL/4 ──▶ not renewed for LeaseTTL ──▶ LOST
 ```
 
-Two heartbeat thresholds rather than one, because a single missed heartbeat means
-almost nothing. `SUSPECT` stops the bleeding — no new work — without paying for
-reclamation. Collapsing the two would turn every GC pause into a round of duplicate
-executions.
+**Two heartbeat thresholds rather than one** is the detail that matters. A single
+missed heartbeat means almost nothing. `SUSPECT` stops the bleeding — the worker
+receives no new work — without paying the cost of reclamation. Collapsing the two
+would turn every GC pause into a round of duplicate executions.
 
-### Stale attempt protection
+Losing a worker is strong evidence about *all* of its attempts simultaneously, so
+worker death is the fast path and lease expiry is the backstop that catches what
+heartbeats cannot see.
+
+Tested by `TestSuspectWorkerKeepsItsWork` (a worker that drops 100% of heartbeats
+but keeps renewing finishes its job on the first attempt) and
+`TestLeaseExpiryReclaimsAStuckWorker` (a worker that heartbeats but drops 100% of
+renewals loses that one attempt and stays `HEALTHY`).
+
+</details>
+
+<details>
+<summary><b>Stale attempt protection — the resurrected worker</b></summary>
+
+<br/>
 
 ```
 t0  worker A is assigned job J, attempt 1, lease L1
-t1  A is partitioned; it keeps running
+t1  A is partitioned; it keeps running the job
 t2  L1 expires; attempt 1 → LOST, J requeued
-t3  J assigned to worker B as attempt 2, lease L2
+t3  J is assigned to worker B as attempt 2, lease L2
 t4  A's partition heals
 t5  A reports "J completed successfully"
 ```
 
-At t5 that report must not become J's outcome — B may still be running and may
-produce a different one. Every worker RPC carries `(job_id, attempt_id, lease_id)`,
-and the scheduler validates inside the transaction that the attempt exists, that the
-lease matches, and that it is still the job's current attempt. A's report is
-rejected with `FAILED_PRECONDITION` and recorded as an observed duplicate execution —
-counted, not hidden.
+At `t5`, A's report **must not** become J's outcome — B may still be running and may
+produce a different one.
 
-Which faults are handled, how fast, and which are not:
-[`docs/FAILURE_MODEL.md`](docs/FAILURE_MODEL.md).
+Every worker-originated mutation carries `(job_id, attempt_id, lease_id)`, and
+`validateRef` checks inside the transaction that the attempt exists, belongs to the
+job, the lease id matches, and it is still the job's `current_attempt_id`. A's report
+is rejected with `FAILED_PRECONDITION`.
 
-## Persistence
+The subtle part is distinguishing *stale* from *replayed*. An attempt in `LOST` was
+reclaimed, so anything its old owner says is stale by definition. An attempt in
+`SUCCEEDED`/`FAILED`/`CANCELED` reached that state through this same caller, so a
+repeat is an idempotent retry after a lost response and returns the recorded
+outcome. One is an error; the other must not be.
 
-SQLite in WAL mode with `synchronous=FULL`, a single pinned writer connection, and a
-separate read pool. A job is acknowledged to a client only after its row has been
-`fsync`'d.
+The late success is also *counted*: `atlas_duplicate_executions_detected_total`, plus
+a durable marker on the attempt row so the number survives a scheduler restart.
 
-The store exposes *transactions*, not operations. Callers compose their reads and
-writes inside `Update(func(*Tx) error)`, so assigning a job — create the attempt,
-move the job to `ASSIGNED`, reserve the worker's capacity — is one atomic fact
-rather than three hopeful ones. Two correctness rules are enforced by the data layer
-rather than by convention:
+Tested by `TestStaleAttemptCannotOverwriteCurrentResult` and
+`TestForgedLeaseIsRejected`.
 
-- State changes only happen through `TransitionJob` / `TransitionAttempt`, which
-  validate the edge and append to the audit log.
-- `SaveWorker` refuses negative or oversubscribed allocations, so no scheduler bug
-  can oversubscribe a worker; the transaction simply fails.
+</details>
 
-On restart the scheduler marks every worker `SUSPECT`, recomputes each worker's
-allocation from the attempts actually live on it, reclaims every lease that lapsed
-while it was down, and rebuilds the queue preserving `enqueued_at` so a restart does
-not reset accrued priority.
+<details>
+<summary><b>The ready queue — why buckets beat a heap under priority aging</b></summary>
 
-## Idempotency
+<br/>
 
-**Submission** is keyed on `idempotency_key`, which is `UNIQUE` in the database.
-Resubmitting returns the same `job_id` with `deduplicated=true`. Reusing a key with
-materially different parameters returns `ALREADY_EXISTS` rather than silently
-returning the old job — otherwise a client would believe it had submitted work Atlas
-never saw.
+Effective priority under aging is `base + rate × wait`, which changes continuously
+for every queued job. A binary heap cannot hold that: its keys mutate underneath it
+and the heap property silently breaks.
 
-**Completion** is idempotent per attempt. `StartJob`, `RenewLease`, `CompleteJob`,
-and `FailJob` can all be safely retried, because the loss of a *response* is
-indistinguishable from the loss of a *request*. A replay returns the recorded
-outcome rather than applying a second state change.
-
-The deduplication lookup deliberately happens *before* admission control: a client
-retrying a submission it is unsure about must get the same answer it would have got
-the first time, even if the queue filled up in between.
-
-## Backpressure
-
-Admission control bounds the queue depth, the in-flight jobs per client, and the
-per-job request size, and rejects jobs no registered worker could ever run.
-Rejection is `RESOURCE_EXHAUSTED`, which tells the caller to back off, rather than
-an unbounded queue, which tells it nothing.
-
-The cost of not having it is measured in [`docs/RESULTS.md`](docs/RESULTS.md):
-at 2× capacity, an unbounded queue grew to 10,178 jobs and p99 wait reached 10.5
-minutes while still reporting success to every caller.
-
-## Observability
-
-Prometheus metrics on `/metrics`, covering submissions, completions, rejections,
-attempts, retries, lease expirations, stale rejections, duplicate executions,
-idempotent replays, worker counts by state, queue depth split by backoff
-eligibility, schedule latency, job wait and runtime, fleet allocation and
-utilization, and recovery latency.
-
-Health endpoints distinguish the two questions that are usually conflated: `/live`
-asks whether the process is running, `/ready` asks whether it can safely accept work
-(it fails if the database does not answer). The standard gRPC health protocol is
-served as well.
-
-Logs are events with identifiers, never sentences:
+The structure Atlas uses instead is a **map of per-priority deques, each sorted by
+enqueue time**:
 
 ```
-event=job_assigned   job_id=job_42 attempt_id=att_9f attempt=2 worker_id=w3 lease_id=lse_11
-event=lease_expired  job_id=job_42 attempt_id=att_9f worker_id=w3 late_by_ms=812
-event=job_requeued   job_id=job_42 attempt_id=att_9f failure_class=WORKER_LOST backoff_ms=340
+priority 100 ──▶ [oldest] ─ … ─ [newest]      ← head is this bucket's best job
+priority  50 ──▶ [oldest] ─ … ─ [newest]
+priority   0 ──▶ [oldest] ─ … ─ [newest]
+                     ▲
+            compare only the heads: O(distinct priorities), not O(queued jobs)
 ```
 
-## Chaos testing
+For FIFO, strict priority, and priority-with-aging, all three orderings are monotone
+in wait time within a fixed base priority, so the best job in a bucket is always its
+oldest. Comparing bucket heads therefore finds the global best in time independent
+of queue depth. Earliest-deadline-first breaks that monotonicity, so it gets a real
+heap.
 
-`atlas-chaos` starts a real scheduler and real workers as child processes and
-injects faults the way they happen in production: `SIGKILL`, `SIGSTOP` (a worker
-that is alive, holds its leases, and answers nothing), scheduler restarts, dropped
-heartbeats, dropped lease renewals, and replayed RPCs.
+**Measured** (`make bench`): pop cost is 159 ns at depth 100 and 166 ns at depth
+100,000 for FIFO; EDF shows the expected O(log n) growth from 176 ns to 442 ns.
 
-Afterwards it reads the SQLite database the run produced and checks all nine
-documented invariants, exiting non-zero on any violation so it works as a CI gate
-rather than only as a demo:
+A separate delay heap holds jobs in retry backoff, so a job waiting out its backoff
+never blocks the head of the queue.
 
-1. Terminal states are absorbing — verified against the *audit log*, not the final
-   rows, so a job that went `SUCCEEDED` then `RUNNING` then `SUCCEEDED` is caught.
-2. No worker is oversubscribed, and no allocation goes negative.
-3. Each worker's allocation equals the sum of its live attempts' requests.
-4. At most one live attempt per job, and the job points at it.
-5. `attempt_count ≤ max_attempts`, and the attempt rows agree with the counter.
-6. Every job acknowledged to a client is still in the store.
-7. Idempotency keys are unique.
-8. No stale attempt decided a job's outcome.
-9. Job state and current attempt state agree.
+</details>
 
-The checker has its own tests, which build a database containing each specific
-violation and assert that it is named. An invariant checker that has only ever seen
-valid states is not evidence that it would catch an invalid one.
+<details>
+<summary><b>Transactional resource accounting — making oversubscription unrepresentable</b></summary>
+
+<br/>
+
+The store exposes **transactions, not operations**:
+
+```go
+err := store.Update(ctx, func(tx *store.Tx) error {
+    job, _   := tx.GetJob(jobID)
+    worker, _:= tx.GetWorker(workerID)
+
+    tx.InsertAttempt(attempt)                       // create the physical execution
+    tx.TransitionJob(job, state.JobAssigned, "…")   // validated edge + audit row
+    job.AttemptCount++
+    tx.SaveJob(job)
+
+    worker.Allocated = worker.Allocated.Add(job.Request)
+    return tx.SaveWorker(worker)                    // REFUSES if it oversubscribes
+})
+```
+
+Composing at the call site is what makes "create the attempt, move the job, reserve
+the capacity" one atomic fact rather than three hopeful ones. Two rules are enforced
+by the data layer rather than by convention:
+
+1. **State only changes through `TransitionJob` / `TransitionAttempt`,** which
+   validate the edge against `internal/state` and append to an audit table. Terminal
+   states are absorbing *by construction*, and the audit log makes it checkable over
+   a whole run rather than only at the end.
+2. **`SaveWorker` rejects negative or oversubscribed allocations.** No scheduler bug
+   can oversubscribe a worker; the transaction simply does not commit.
+
+Allocation is denormalized onto the worker row so placement needs no aggregate
+query. Invariant **I3** — `worker.allocated == Σ(live attempts' requests)` — is what
+keeps that denormalization trustworthy, and recovery recomputes it from scratch.
+
+</details>
+
+<details>
+<summary><b>Concurrency model and cache coherence</b></summary>
+
+<br/>
+
+Three things run concurrently in the scheduler:
+
+| | |
+| --- | --- |
+| gRPC handlers | one goroutine per call |
+| Dispatch loop | woken by a capacity-1 channel, so a burst of submissions collapses into one sweep |
+| Reconcile loop | 250 ms ticker: worker health, lease expiry, queue resync |
+
+Shared state sits behind a single mutex that is **never held across a database
+transaction**. (That was a real bug: `CancelJob` and the completion path originally
+refreshed a cached worker view by querying *inside* the critical section, putting
+query latency in the dispatcher's path on every completion — fixed in `ebe29bc`.)
+Each worker has a small mailbox lock for undelivered assignments; the lock order is
+scheduler-then-mailbox and never the reverse.
+
+The in-memory fleet and ready queue are **caches**, reconciled three ways:
+
+| Cached state | Reconciled by |
+| --- | --- |
+| Worker allocation | Overwritten from committed rows after every dispatch batch, lease sweep, and completion; recomputed from scratch on recovery |
+| Ready queue | Additively resynced from the `QUEUED` rows every second, so a crash between committing a requeue and pushing it in memory cannot strand a job |
+| Worker health | Derived from heartbeats; recovery marks every worker `SUSPECT` and lets a heartbeat promote it |
+
+The resync is additive only — removing entries would race with concurrent
+submissions, and is unnecessary because placement re-validates every job against its
+row before assigning it.
+
+</details>
+
+<details>
+<summary><b>Crash recovery</b></summary>
+
+<br/>
+
+On startup the scheduler rebuilds everything from the store:
+
+1. Mark every worker `SUSPECT` — their heartbeat age is unknown and their
+   connections died with the old process. A single heartbeat promotes them back.
+2. Recompute each worker's allocation from the attempts actually live on it,
+   re-establishing invariant I3 by construction rather than trusting columns a crash
+   may have left behind.
+3. Reclaim every lease that lapsed while the process was down.
+4. Rebuild the ready queue from `QUEUED` rows, **preserving `enqueued_at`** so a
+   restart does not reset accrued priority — sorted oldest-first, because
+   newest-first insertion made the rebuild quadratic (caught by the queue benchmark,
+   fixed in `b2550e7`).
+
+Leases are deliberately **not** extended to account for downtime. A worker that
+could not renew has lost its authority: the scheduler could not observe it, so it
+assumes nothing. The cost is some duplicate execution after a long outage, which is
+exactly what at-least-once permits — and what the chaos campaign measures.
+
+</details>
+
+---
 
 ## Results
 
-Full tables and methodology: [`docs/RESULTS.md`](docs/RESULTS.md) and
-[`docs/BENCHMARKING.md`](docs/BENCHMARKING.md). Four findings worth the summary.
+Full tables, methodology, and limitations: [`docs/RESULTS.md`](docs/RESULTS.md) and
+[`docs/BENCHMARKING.md`](docs/BENCHMARKING.md). Raw output in [`results/`](results).
+Reproduce with `make experiments && make chaos-campaign`.
 
-**Fleet heterogeneity costs far more than policy choice, and best-fit is the worst
-answer to it.** Two fleets with *identical* total capacity — 384 cores, 928 GiB, 20
-machines — differ only in machine shape:
+### Fleet heterogeneity costs more than policy choice — and best-fit inverts
 
-| Fleet | Policy | Mean wait | p99 wait | Stranded CPU |
-| --- | --- | --- | --- | --- |
-| uniform | best-fit | 2.48s | 51.7s | 8.3% |
-| uniform | least-loaded | 2.65s | 61.0s | 10.3% |
-| heterogeneous | least-loaded | 12.1s | 6.7m | 18.1% |
-| heterogeneous | round-robin | 24.8s | 12.4m | 22.8% |
-| heterogeneous | **best-fit** | **89.2s** | **19.6m** | **27.9%** |
+![Fragmentation: identical total capacity, only machine shape differs](docs/images/fragmentation.png)
 
-Best-fit is 7× worse than least-loaded on the heterogeneous fleet while being
-marginally the best on the uniform one. Minimizing leftover capacity spends the
-scarce, specifically-shaped resources on jobs that did not need them — a 1-core /
-12 GiB job "best-fits" a 32-core / 16 GiB compute node, consuming that node's scarce
-memory and blocking the CPU-heavy work it exists for.
+Two fleets with **identical total capacity** — 384 cores, 928 GiB, 20 machines —
+differing only in the shape of the machines. Same workload, same arrival sequence,
+same seed.
 
-**An aging cap can silently restore the starvation it was added to prevent.**
-Low-priority jobs under a saturated cluster:
+Best-fit is marginally the *best* policy on the uniform fleet (2.48 s) and **7×
+worse than least-loaded** on the heterogeneous one (89.2 s vs 12.1 s). The mechanism
+is specific: minimizing leftover capacity spends *scarce, specifically-shaped*
+resources on jobs that did not need them. A 1-core / 12 GiB job "best-fits" onto a
+32-core / 16 GiB compute node, because 16 GiB leaves less slack than the memory
+node's 128 GiB would — consuming that node's scarce memory and blocking the
+CPU-heavy work it exists to run.
+
+The generalizable lesson: tight packing is only a virtue when the thing you pack
+into is interchangeable.
+
+### Admission control converts an invisible failure into a visible one
+
+![Overload: p99 wait and queue depth, with and without admission control](docs/images/overload.png)
+
+At and below capacity the two configurations are indistinguishable — backpressure
+costs nothing until it is needed. Above capacity they diverge completely. Without
+it, **every submission succeeds**: the caller gets a job id and a `QUEUED` state and
+no indication whatsoever that anything is wrong, while p99 wait climbs to 18 minutes
+and the queue reaches 17,451. With a bounded queue, p99 wait stays flat at ~33 s
+across an 8× range of offered load and the excess comes back immediately as
+`RESOURCE_EXHAUSTED`.
+
+The honest cost is visible too: at 128/sec the bounded queue's CPU utilization drops
+to 81%, because a 500-deep queue is sometimes too shallow to keep every worker fed
+through a dip. Backpressure trades a little utilization for bounded, observable
+latency.
+
+### The O(workers) placement scan is fine to ~10,000 machines
+
+![Decision cost versus fleet size](docs/images/decision-cost.png)
+
+Least-loaded and best-fit are strictly linear — 53 ns at 10 workers, 21 µs at
+10,000, still ~47,000 decisions/sec on a single core. There is no case for indexing
+workers by available capacity until the fleet is an order of magnitude larger, and
+the simpler linear scan is worth keeping until then.
+
+Round-robin's cost is **bimodal, not low**: flat at 35 ns whenever some worker fits,
+and 25 µs when none does — making it the most expensive policy precisely when the
+cluster is under pressure.
+
+### An aging cap can silently restore the starvation it was added to prevent
 
 | Ordering | urgent mean wait | batch mean wait |
 | --- | --- | --- |
-| fifo | 6.4m | 6.4m |
-| strict priority | 3.2m | 13.6m |
-| aging 1/s, cap 1000 | 5.2m | 9.1m |
-| aging 10/s, cap 1000 | 3.8m | 12.3m |
-| aging 10/s, no cap | 6.3m | 6.7m |
+| fifo (priority ignored) | 6.4 m | 6.4 m |
+| strict priority | 3.2 m | 13.6 m |
+| aging 1/s, cap 1000 | 5.2 m | 9.1 m |
+| aging 10/s, cap 1000 | 3.8 m | 12.3 m |
+| **aging 10/s, no cap** | **6.3 m** | **6.7 m** |
 
-Aging at 10/s *with a cap* behaves almost like strict priority, because once every
-queued job has saturated the cap the only thing separating the classes is their base
-priority again. The same rate uncapped collapses to FIFO. The cap is not a safety
-rail; it is the dial.
+Aging at 10/s *with a cap* behaves almost like strict priority; the same rate
+uncapped collapses to FIFO. Once every queued job has waited long enough to saturate
+the cap, both classes sit at `base + 1000` and only base priority separates them
+again. The cap is not a safety rail on aging — it is the dial that decides how much
+aging you actually get.
 
-**Admission control converts an invisible failure into a visible one.** At 2× the
-sustainable arrival rate:
+---
 
-| Admission | Accepted | Rejected | Peak queue | p99 wait |
-| --- | --- | --- | --- | --- |
-| none | 20,000 | 0 | 10,178 | 10.5m |
-| queue ≤ 500 | 10,296 | 9,704 | 500 | 34.7s |
+## Engineering decisions
 
-Without it, every submission succeeds and the cost lands entirely on latency, which
-the caller cannot see until it is already enormous.
+<table>
+<tr><th width="18%">Decision</th><th width="41%">Why</th><th width="41%">Alternative and tradeoff</th></tr>
 
-**The O(workers) placement scan is fine to ~10,000 machines.** Least-loaded and
-best-fit are strictly linear: 53 ns at 10 workers, 240 ns at 100, 2.1 µs at 1,000,
-21 µs at 10,000 — still ~47,000 decisions/sec on one core. Round-robin is flat at
-35 ns whenever *some* worker fits, and becomes the most expensive policy when none
-does.
+<tr><td><b>At-least-once, not exactly-once</b></td>
+<td>The scheduler genuinely cannot distinguish "never ran" from "ran, ack lost". Choosing at-least-once makes the ambiguity explicit and pushes deduplication to the only layer that can do it — the workload, which gets a stable <code>ATLAS_JOB_ID</code>.</td>
+<td><i>At-most-once</i> (never retry) would be simpler and would silently drop work on every machine failure. <b>Tradeoff:</b> callers must make side effects idempotent; Atlas publishes the duplicate count so they know how often it matters.</td></tr>
 
-**The chaos campaign's most important number is not zero.** Across 50 injected
-faults, 3,000 of 3,000 jobs succeeded and all nine invariants held — but sixteen
-times a reclaimed worker reported afterwards that it had in fact finished its job.
-Those jobs really did run twice. Atlas rejected the late reports so none of them
-changed an outcome, and then published the count. A chaos report claiming zero
-duplicates under at-least-once semantics is either measuring nothing or lying.
-Chaos runs are deliberately not bit-reproducible: between two runs of the identical
-command the fault counts moved by 30–50%, while "every job finished" and "zero
-invariant violations" did not move at all. Those are the two rows that are supposed
-to be properties rather than measurements.
+<tr><td><b>Single scheduler, no Raft</b></td>
+<td>Consensus is the reflex answer to "distributed scheduler" and it would make this project worse. The hard parts here are lease ownership, failure detection, resource accounting, idempotency, and <i>proving</i> the result.</td>
+<td><i>Raft</i> adds a large surface of subtle bugs without improving any of those. <b>Tradeoff:</b> Atlas is crash-<i>recoverable</i>, not highly available. Stated plainly rather than papered over.</td></tr>
 
-## Running it
+<tr><td><b>Workers pull; scheduler decides</b></td>
+<td>Keeps every connection worker-initiated (no inbound reachability, no service discovery) while keeping placement centralized and comparable.</td>
+<td><i>Scheduler pushes</i> needs routes into the fleet. <i>Workers self-select</i> makes the policy an artifact of poll order. <b>Tradeoff:</b> one long-poll round trip of dispatch latency.</td></tr>
+
+<tr><td><b>SQLite, single writer, <code>synchronous=FULL</code></b></td>
+<td>A job is acknowledged only after its row is <code>fsync</code>'d. Pinning one write connection removes <code>SQLITE_BUSY</code> from the failure model entirely.</td>
+<td><i>Postgres</i> adds an operational dependency for a single-node control plane. <i>WAL + <code>synchronous=NORMAL</code></i> is faster and can lose recent commits on power loss. <b>Tradeoff:</b> one fsync per batch, which is why batching exists.</td></tr>
+
+<tr><td><b>Batched placement commits</b></td>
+<td>Durability costs an fsync; committing up to 256 placements together turns N fsyncs into one.</td>
+<td><i>One transaction per placement</i> is simpler and caps throughput at the disk's fsync rate. <b>Tradeoff:</b> partial-batch failures need explicit handling, so each item is re-validated inside the transaction.</td></tr>
+
+<tr><td><b>Bucketed deques, not a heap</b></td>
+<td>Priority aging mutates every key continuously, which a heap cannot tolerate. Monotonicity within a bucket makes head-comparison exact.</td>
+<td><i>Heap with periodic rebuild</i> is O(n log n) per rebuild and approximate between them. <b>Tradeoff:</b> EDF breaks the monotonicity assumption and needs a separate heap.</td></tr>
+
+<tr><td><b>Denormalized allocation + invariant I3</b></td>
+<td>Placement must not run an aggregate query per decision. The denormalized column is fast; I3 is what makes it trustworthy, and recovery recomputes it.</td>
+<td><i>Derive from live attempts every time</i> is always correct and too slow for the hot path. <b>Tradeoff:</b> a second source of truth, which is why it is checked mechanically rather than assumed.</td></tr>
+
+<tr><td><b><code>PROCESS_EXIT</code> not retried by default</b></td>
+<td>A deterministic program that exits 1 will exit 1 again. Retrying burns cluster capacity to produce the same answer.</td>
+<td><i>Retry everything</i> hides nothing and wastes capacity. <b>Tradeoff:</b> genuinely flaky workloads must opt in via <code>--retry-on-process-exit</code>.</td></tr>
+</table>
+
+---
+
+## Tech stack
+
+| | |
+| --- | --- |
+| **Language** | Go 1.22 — goroutines and channels for the dispatch/reconcile loops, `log/slog` for structured events, `math/rand/v2` for jittered backoff |
+| **RPC & schema** | gRPC, Protocol Buffers (two services: client-facing and worker-facing), gRPC health checking protocol, server reflection |
+| **Storage** | SQLite via `modernc.org/sqlite` (pure Go, so `CGO_ENABLED=0` cross-compiles and the container needs no libsqlite); WAL, `synchronous=FULL`, single pinned writer + read pool |
+| **Observability** | Prometheus (`client_golang`) — 20 metrics; logfmt/JSON structured logs; `/live` + `/ready` split; alerting rules in [`deployments/alerts.yml`](deployments/alerts.yml) |
+| **Execution** | Linux process groups (`Setpgid`) so a killed job takes its children with it; Docker CLI executor with kernel-enforced `--cpus` / `--memory` |
+| **Testing** | Go test + race detector, build-tagged integration suite, custom invariant checker, discrete-event simulator, process-level chaos harness |
+| **CI/CD** | GitHub Actions — lint, `staticcheck`, race-detector unit tests, integration tests, a chaos campaign as a correctness gate, proto-drift check, 3-platform cross-compile |
+| **Deployment** | Multi-stage Dockerfile (Go builder → Alpine), Docker Compose with a deliberately heterogeneous fleet + Prometheus |
+
+---
+
+## Repository structure
+
+```
+cmd/                       entry points
+├── atlas-server/          control plane: gRPC API + scheduler + HTTP observability
+├── atlas-worker/          execution agent: register, heartbeat, acquire, renew, run
+├── atlas-cli/             client: submit, get, list, cancel, workers, drain, status
+├── atlas-chaos/           fault-injection campaign runner (exits non-zero on violation)
+└── atlas-sim/             discrete-event scheduling experiments
+
+internal/
+├── state/                 job/attempt/worker state machines — the ONLY legal transitions
+├── types/                 domain objects + resource arithmetic (no behaviour, no cycles)
+├── store/                 SQLite: exposes transactions, validates edges, refuses
+│                          oversubscription, maintains the append-only audit log
+├── scheduler/             placement, leases, retries, admission, recovery
+│   ├── policies.go        round-robin · least-loaded · best-fit
+│   ├── queue.go           bucketed deques + EDF heap + retry-backoff delay heap
+│   ├── dispatch.go        batched, re-validated, durable placement
+│   ├── lease.go           lease expiry, worker health ageing, retry disposition
+│   ├── worker_api.go      the worker protocol + stale-attempt rejection
+│   └── admission.go       backpressure limits
+├── worker/                agent + process and Docker executors
+├── invariants/            mechanical checker for the nine documented invariants
+├── api/                   gRPC wire layer (the only place protobuf meets the domain)
+├── metrics/ logging/      Prometheus collectors, structured event logging
+
+proto/atlas.proto          service + message definitions (generated code committed)
+simulator/                 discrete-event model reusing the real queue and policies
+chaos/                     campaign orchestration + invariant report
+tests/                     integration suite (build tag: integration)
+deployments/               Dockerfile, docker-compose, Prometheus config + alert rules
+docs/                      SEMANTICS · ARCHITECTURE · FAILURE_MODEL · BENCHMARKING · RESULTS
+results/                   committed raw output from the experiments the docs cite
+```
+
+`internal/scheduler` does not import protobuf — which is why the simulator can drive
+the real queue and policies directly, and why the unit tests need no network.
+
+---
+
+## Getting started
+
+**Prerequisites:** Go 1.22+. That is all — the SQLite driver is pure Go, so there is
+no cgo toolchain, no system SQLite, and no database server to install.
+(`protoc` is only needed if you change `proto/atlas.proto`; Docker only for the
+container executor or Compose.)
 
 ```bash
-make build
+git clone https://github.com/BruceMoseti/Atlas.git
+cd Atlas
+make build          # produces ./bin/{atlas-server,atlas-worker,atlas,atlas-chaos,atlas-sim}
+make help           # list every target
+```
 
-# Control plane
+### Run a local cluster
+
+```bash
+# Terminal 1 — control plane
 ./bin/atlas-server --db atlas.db --listen :50051 --http :9090
 
-# Workers
-./bin/atlas-worker --scheduler localhost:50051 --id w1 --cpu 8 --memory 16GB
-./bin/atlas-worker --scheduler localhost:50051 --id w2 --cpu 4 --memory 8GB
+# Terminal 2 — a deliberately heterogeneous fleet
+./bin/atlas-worker --scheduler localhost:50051 --id w1 --cpu 8  --memory 16GB &
+./bin/atlas-worker --scheduler localhost:50051 --id w2 --cpu 4  --memory 8GB  &
+./bin/atlas-worker --scheduler localhost:50051 --id w3 --cpu 16 --memory 64GB &
 
-# Client
+# Terminal 3 — client
 ./bin/atlas submit --cpu 1 --memory 256m --wait -- echo "hello atlas"
-./bin/atlas list
 ./bin/atlas workers
-./bin/atlas drain w2
 ./bin/atlas status
 ```
 
-Or `docker compose -f deployments/docker-compose.yml up` for a scheduler,
-three heterogeneous workers, and Prometheus.
+Or bring the whole thing up, Prometheus included:
 
 ```bash
-make test             # unit tests
-make test-race        # under the race detector
-make test-integration # real gRPC, real SQLite, real worker kills
-make chaos            # a short fault-injection campaign
-make experiments      # every simulator experiment, into ./results
-make bench            # scheduler microbenchmarks
+docker compose -f deployments/docker-compose.yml up --build
 ```
+
+### Observability
+
+```bash
+curl localhost:9090/live      # is the process running?
+curl localhost:9090/ready     # can it safely accept work? (fails if the DB does not answer)
+curl localhost:9090/status    # utilization, queue depth, active policy
+curl localhost:9090/metrics   # Prometheus
+```
+
+---
+
+## Usage
+
+```bash
+# Submit, with an idempotency key — resubmitting returns the SAME job id
+atlas submit --idempotency-key nightly-2026-10-01 \
+             --cpu 2 --memory 4GB --priority 50 --timeout 10m \
+             --max-attempts 5 --retry-on-process-exit \
+             -- python train.py --epochs 10
+
+# Container workloads (worker must run with --executor=docker)
+atlas submit --image python:3.12-slim --cpu 2 --memory 1GB -- python -c "print(1+1)"
+
+# Inspect: full attempt history, which worker ran what, why anything failed
+atlas get job_1a2b3c4d
+atlas list --state RUNNING,QUEUED --limit 20
+
+# Operations
+atlas cancel job_1a2b3c4d --reason "superseded"
+atlas drain w2              # no new work; running jobs finish
+atlas drain w2 --undo
+```
+
+Clients talk gRPC, so any language works. The service is reflection-enabled:
+
+```bash
+grpcurl -plaintext localhost:50051 list atlas.v1.AtlasService
+grpcurl -plaintext -d '{"job_id":"job_1a2b3c4d","include_attempts":true}' \
+        localhost:50051 atlas.v1.AtlasService/GetJob
+```
+
+---
+
+## Testing
+
+The test strategy maps to what each layer can actually prove.
+
+| Layer | Tests | Command | What it establishes |
+| --- | --- | --- | --- |
+| Unit — core packages | 68 | `make test` | Every state-machine edge exhaustively; queue orderings and aging; fit and each policy; backoff bounds and jitter; store transactionality and rollback; executor exit-code classification and process-group kill |
+| ├ of which, invariant checker | 11 | `go test ./internal/invariants/...` | Each invariant, against a database constructed to violate exactly that one |
+| Unit — simulator model | 11 | `go test ./simulator/...` | Determinism under a seed, job conservation, no oversubscription in the model, failure path wired up |
+| **Integration** | **26** | `make test-integration` | Real gRPC over TCP, real SQLite on disk, real worker processes running real commands — then killed |
+| Chaos | — | `make chaos` | Randomized `SIGKILL`/`SIGSTOP`/restarts against real processes; exits non-zero on any invariant violation |
+| Benchmarks | 3 | `make bench` | Placement decision cost and queue operations |
+
+**105 tests total**, all race-clean in CI.
+
+```bash
+make test-race          # everything above, race detector clean (~25s)
+make test-integration   # real processes (~42s with -race)
+make chaos              # short fault-injection campaign (~60s)
+```
+
+Two things worth calling out:
+
+**The invariant checker has its own failure tests.** `internal/invariants` builds
+databases containing each specific violation — a resurrected terminal state, an
+oversubscribed worker, two live attempts on one job — and asserts the checker names
+it. A checker that has only ever seen valid states is not evidence that it would
+catch an invalid one.
+
+**The simulator is tested too.** Determinism under a seed, job conservation, no
+oversubscription inside the model, and that the failure path is actually wired up.
+A simulator with a bug produces convincing wrong numbers, which is worse than
+producing none.
+
+### Edge cases covered
+
+Lost `StartJob` followed by a fast completion · forged lease ids · duplicate
+completion after a lost response · a worker re-registering with the same id ·
+cancellation of a job mid-execution · a job larger than any machine · corrupted
+allocation columns at startup · scheduler restart with and without a surviving
+fleet · a worker that heartbeats but never renews · a worker that renews but never
+heartbeats.
+
+---
+
+## Future improvements
+
+Ordered by what would materially strengthen the system, not by effort.
+
+1. **Verify the Docker executor against a live daemon.** It is implemented and
+   documented but has never actually run — the development environment had no
+   Docker. Until it does, only the process executor is evidence of anything.
+2. **Leader election over a replicated log for HA.** Not Raft-from-scratch: an
+   embedded consensus library holding only the leadership lease, with the existing
+   SQLite store replicated by log shipping. Atlas today is crash-recoverable but not
+   available during a restart, and the restart window is the only unbounded outage
+   in the failure model.
+3. **Replace the per-sweep linear fleet scan with capacity-bucketed indexing** once
+   fleets exceed ~10,000 workers. Benchmarks show the scan costs 21 µs at 10k, so
+   this is explicitly *not* worth doing yet — the measurement is the justification
+   for leaving it alone.
+4. **Gang scheduling for jobs that need N workers simultaneously.** Requires
+   all-or-nothing placement across multiple workers in one transaction, which the
+   batched-commit path already structurally supports but the queue does not model.
+5. **Oversubscription with preemption.** Allow allocation beyond 100% for jobs
+   marked best-effort, and preempt them when a guaranteed job needs the capacity.
+   Needs a priority-aware eviction policy and a `PREEMPTED` failure class that is
+   retryable without counting against the attempt budget.
+6. **Replace the long-poll mailbox with a server-streaming RPC.** Long polling costs
+   a round trip per dispatch; a stream would cut assignment latency and let the
+   scheduler push cancellations immediately instead of waiting for the next
+   heartbeat.
+7. **mTLS and per-client authentication.** `client_id` is a quota bucket, not an
+   identity. Atlas currently assumes a trusted network.
+
+---
 
 ## Limitations
 
-Stated plainly, because a system's limits are part of its specification.
+Stated here rather than discovered later.
 
 - **Not highly available.** One scheduler process, no consensus, no replication. If
   it dies the control plane is unavailable until it restarts; running jobs keep
   running and are reconciled afterwards. Atlas is crash-*recoverable*, not
   fault-*tolerant to scheduler loss*. It does not survive loss of its disk.
-- **No Raft, deliberately.** Consensus is the reflex answer to "distributed
-  scheduler" and it would make this project worse: the hard parts here are lease
-  ownership, failure detection, resource accounting, idempotency, and proving the
-  result, and a hand-rolled consensus implementation would add a large surface of
-  subtle bugs without improving any of them.
-- **The Docker executor is unverified.** It is implemented and documented, but the
-  development environment had no Docker daemon, so only the process executor has
-  actually been run.
-- **No authentication, authorization, or TLS.** `client_id` is a quota bucket, not
-  an identity. Atlas assumes a trusted network.
-- **No job dependencies**, no DAGs, no workflows, no autoscaling, no GPU support.
-- **Duplicate execution counts are a lower bound.** Atlas counts the duplicates it
+- **The Docker executor is unverified.** Implemented and documented; never run
+  against a live daemon.
+- **No authentication, authorization, or TLS.** Trusted-network assumption.
+- **No job dependencies, DAGs, autoscaling, or GPU support.**
+- **Duplicate-execution counts are a lower bound.** Atlas counts the duplicates it
   observes — a reclaimed worker reporting success afterwards. A worker that dies
   mid-job without reporting leaves no evidence either way, and nothing can recover
-  that evidence later.
-- **Benchmarks are single-machine, single-run.** The differences reported above are
-  large enough that noise does not explain them; the small ones in the full tables
-  should not be read as real.
+  it later.
+- **Benchmarks are single-machine, single-run.** The differences highlighted above
+  are factors rather than percentages, so noise does not explain them; small
+  differences in the full tables should not be read as real.
+
+---
+
+## Documentation
+
+| | |
+| --- | --- |
+| [`docs/SEMANTICS.md`](docs/SEMANTICS.md) | **Normative.** Written before the scheduler. Execution guarantees, both state machines, the lease model, stale-attempt protection, idempotency, retry classification, and the nine invariants. |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Request flow, package boundaries, concurrency model, cache reconciliation, and an explicit "what Atlas is not". |
+| [`docs/FAILURE_MODEL.md`](docs/FAILURE_MODEL.md) | Every fault handled, its detection bound, its response, and the test covering it — plus the faults that are *not* handled. |
+| [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md) | What each measurement tool can and cannot claim, precise metric definitions, eight named limitations. |
+| [`docs/RESULTS.md`](docs/RESULTS.md) | Every measured number, including the unflattering ones. |
+| [`PROJECT_NOTES.md`](PROJECT_NOTES.md) | Design rationale, the hardest problems, bugs found and how, and interview-style Q&A. |
+
+---
+
+<div align="center">
+<sub>MIT licensed · built as a focused study of distributed systems failure handling</sub>
+</div>
