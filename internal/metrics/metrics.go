@@ -28,9 +28,9 @@ type Metrics struct {
 	WorkersTotal   prometheus.Gauge
 	WorkersByState *prometheus.GaugeVec
 
-	QueueDepth      prometheus.Gauge
-	ScheduleLatency prometheus.Histogram
-	DispatchDecisis *prometheus.CounterVec
+	QueueDepth        prometheus.Gauge
+	ScheduleLatency   prometheus.Histogram
+	DispatchDecisions *prometheus.CounterVec
 
 	JobWaitSeconds    prometheus.Histogram
 	JobRuntimeSeconds prometheus.Histogram
@@ -84,7 +84,7 @@ func New(reg prometheus.Registerer) *Metrics {
 		ScheduleLatency: f.histogram("atlas_schedule_latency_seconds",
 			"Time from a job becoming dispatchable to being assigned to a worker.",
 			prometheus.ExponentialBuckets(0.0005, 2.5, 14)),
-		DispatchDecisis: f.counterVec("atlas_dispatch_decisions_total",
+		DispatchDecisions: f.counterVec("atlas_dispatch_decisions_total",
 			"Placement decisions, by outcome.", "outcome"),
 
 		JobWaitSeconds: f.histogram("atlas_job_wait_seconds",

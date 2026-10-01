@@ -100,7 +100,7 @@ func (s *Scheduler) dispatchOnce(ctx context.Context) (int, error) {
 	if len(batch) == 0 {
 		s.mu.Unlock()
 		if len(unplaced) > 0 {
-			s.met.DispatchDecisis.WithLabelValues("no_capacity").Add(float64(len(unplaced)))
+			s.met.DispatchDecisions.WithLabelValues("no_capacity").Add(float64(len(unplaced)))
 		}
 		return 0, nil
 	}
@@ -158,8 +158,8 @@ func (s *Scheduler) dispatchOnce(ctx context.Context) (int, error) {
 			"memory_bytes", a.assignment.Request.MemoryBytes)
 	}
 
-	s.met.DispatchDecisis.WithLabelValues("assigned").Add(float64(len(assignments)))
-	s.met.DispatchDecisis.WithLabelValues("revalidation_failed").Add(float64(len(rejected)))
+	s.met.DispatchDecisions.WithLabelValues("assigned").Add(float64(len(assignments)))
+	s.met.DispatchDecisions.WithLabelValues("revalidation_failed").Add(float64(len(rejected)))
 	s.met.AttemptsTotal.WithLabelValues("created").Add(float64(len(assignments)))
 	s.refreshFleetMetrics()
 

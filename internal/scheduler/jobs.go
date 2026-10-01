@@ -329,14 +329,19 @@ func (s *Scheduler) CancelJob(ctx context.Context, id, reason string) (state.Job
 	}
 
 	if canceled {
+		// Re-read the worker before taking the lock: the row changed when the
+		// attempt was canceled, and holding the scheduler mutex across a query
+		// would put database latency in the dispatcher's path.
+		fresh := s.loadWorker(ctx, workerID)
+
 		s.mu.Lock()
 		s.queue.Remove(id)
-		if workerID != "" {
-			if ws, ok := s.workers[workerID]; ok {
-				if ws.view.Running > 0 {
-					ws.view.Running--
-				}
-				s.reloadWorkerLocked(ctx, workerID)
+		if ws, ok := s.workers[workerID]; ok {
+			if ws.view.Running > 0 {
+				ws.view.Running--
+			}
+			if fresh != nil {
+				s.syncWorkerLocked(fresh)
 			}
 		}
 		s.mu.Unlock()
@@ -348,9 +353,14 @@ func (s *Scheduler) CancelJob(ctx context.Context, id, reason string) (state.Job
 	return final, canceled, nil
 }
 
-// reloadWorkerLocked refreshes one cached worker view from its row. Caller holds
-// s.mu; the read runs on the read pool and does not contend with the write handle.
-func (s *Scheduler) reloadWorkerLocked(ctx context.Context, id string) {
+// loadWorker reads one worker row, returning nil if it cannot. Callers use it to
+// refresh a cached view, and it deliberately does not take s.mu: no database query
+// should ever run while the scheduler mutex is held, because that mutex is also the
+// dispatcher's.
+func (s *Scheduler) loadWorker(ctx context.Context, id string) *types.Worker {
+	if id == "" {
+		return nil
+	}
 	var w *types.Worker
 	err := s.store.View(ctx, func(tx *store.Tx) error {
 		var err error
@@ -358,7 +368,7 @@ func (s *Scheduler) reloadWorkerLocked(ctx context.Context, id string) {
 		return err
 	})
 	if err != nil {
-		return
+		return nil
 	}
-	s.syncWorkerLocked(w)
+	return w
 }

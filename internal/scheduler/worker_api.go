@@ -608,16 +608,24 @@ func (s *Scheduler) FailJob(ctx context.Context, ref AttemptRef, class state.Fai
 	return res, nil
 }
 
-// releaseWorkerSlot refreshes a worker's cached view after one of its attempts ended.
+// releaseWorkerSlot refreshes a worker's cached view after one of its attempts
+// ended. The row is read before the lock is taken, so completion reports never put
+// database latency in the dispatcher's path.
 func (s *Scheduler) releaseWorkerSlot(ctx context.Context, workerID string) {
 	if workerID == "" {
 		return
 	}
+	fresh := s.loadWorker(ctx, workerID)
+
 	s.mu.Lock()
-	if ws, ok := s.workers[workerID]; ok && ws.view.Running > 0 {
-		ws.view.Running--
+	if ws, ok := s.workers[workerID]; ok {
+		if ws.view.Running > 0 {
+			ws.view.Running--
+		}
+		if fresh != nil {
+			s.syncWorkerLocked(fresh)
+		}
 	}
-	s.reloadWorkerLocked(ctx, workerID)
 	s.mu.Unlock()
 	s.signalDispatch()
 }
