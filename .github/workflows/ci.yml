@@ -1,0 +1,176 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Pinned so a toolchain auto-download can never silently change what CI tests.
+  GOTOOLCHAIN: local
+
+jobs:
+  lint:
+    name: Lint and vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l ./cmd ./internal ./simulator ./chaos ./tests)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt'd:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet -tags integration ./...
+
+      - name: staticcheck
+        uses: dominikh/staticcheck-action@v1
+        with:
+          version: "2024.1.1"
+          install-go: false
+
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+
+  unit:
+    name: Unit tests (race detector)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: Unit tests
+        run: go test -race -timeout 10m ./internal/... ./simulator/... ./cmd/...
+
+  integration:
+    name: Integration tests (real gRPC, SQLite, worker processes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      # These start a real gRPC server over TCP, a real SQLite database on disk,
+      # and real worker agents that execute real processes, then kill them.
+      - name: Integration tests
+        run: go test -race -tags integration -timeout 20m ./tests/...
+
+  chaos:
+    name: Chaos campaign (fault injection + invariant check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      - name: Build binaries
+        run: make build
+
+      # Exits non-zero if any of the nine documented invariants was violated,
+      # so this is a correctness gate rather than a demo.
+      - name: Randomized fault injection
+        run: |
+          ./bin/atlas-chaos \
+            --workers 6 --jobs 400 --duration 45s --job-duration 1s \
+            --fault-interval 2s --drain-timeout 180s \
+            --restart-scheduler --duplicate-rpc-rate 0.2 \
+            --heartbeat-drop-rate 0.1 --renew-drop-rate 0.05 \
+            --max-attempts 10 \
+            --report chaos-report.txt
+
+      - name: Upload chaos report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-report
+          path: chaos-report.txt
+          if-no-files-found: ignore
+
+  proto:
+    name: Generated protobuf is up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      # Pinned rather than apt-installed. The generated files record the
+      # versions that produced them, so an unpinned protoc would make this
+      # check fail whenever the runner image changed its Ubuntu release —
+      # a false failure that has nothing to do with proto drift.
+      - name: Install pinned protoc
+        run: |
+          version=$(make -s print-protoc-version)
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v$version/protoc-$version-linux-x86_64.zip"
+          unzip -q /tmp/protoc.zip -d /tmp/protoc
+          echo "/tmp/protoc/bin" >> "$GITHUB_PATH"
+
+      - name: Install pinned protoc plugins
+        run: make tools
+
+      # Generated code is committed so that `go build` works without protoc.
+      # This job is what keeps it honest.
+      - name: Show toolchain versions
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          protoc --version
+          protoc-gen-go --version
+          protoc-gen-go-grpc --version
+
+      - name: Regenerate and diff
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          make proto
+          if ! git diff --exit-code -- proto/; then
+            echo "proto/atlas.proto changed but the generated code was not regenerated."
+            echo "Run 'make proto' and commit the result."
+            exit 1
+          fi
+
+  build-matrix:
+    name: Build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: true
+
+      # CGO_ENABLED=0 works because Atlas uses a pure-Go SQLite driver. That is
+      # what makes cross-compilation and a scratch-sized container possible.
+      - name: Cross-compile
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: go build ./...

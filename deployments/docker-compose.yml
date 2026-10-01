@@ -1,0 +1,106 @@
+# A local Atlas cluster: one scheduler, three workers of deliberately different
+# shapes, and Prometheus.
+#
+# The workers are heterogeneous on purpose. A fleet of identical machines makes
+# every placement policy look the same; the interesting behaviour — and the
+# fragmentation measured in docs/RESULTS.md — only appears when machine shapes
+# differ along both CPU and memory.
+#
+#   docker compose -f deployments/docker-compose.yml up --build
+#   docker compose -f deployments/docker-compose.yml exec scheduler \
+#       atlas --server localhost:50051 submit --cpu 1 --memory 256m -- echo hello
+#
+# Workers here use the process executor, not the Docker executor: running
+# containers from inside a container needs the host's Docker socket, which is a
+# deployment decision this file should not make for you. See the commented-out
+# block on worker-a.
+
+services:
+  scheduler:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+    command:
+      - atlas-server
+      - --listen=:50051
+      - --http=:9090
+      - --db=/data/atlas.db
+      - --policy=least-loaded
+      - --ordering=priority-aging
+      - --log-level=info
+    ports:
+      - "50051:50051"
+      - "9090:9090"
+    volumes:
+      - atlas-data:/data
+    healthcheck:
+      # Readiness, not liveness: the scheduler is only ready once its database
+      # answers, and workers should not be started against one that is not.
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  worker-a:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+    command:
+      - atlas-worker
+      - --scheduler=scheduler:50051
+      - --id=worker-a
+      - --cpu=8
+      - --memory=16GB
+      - --labels=shape=general
+    depends_on:
+      scheduler:
+        condition: service_healthy
+    # To run containerized workloads instead of processes, mount the host's
+    # Docker socket and switch the executor:
+    #   volumes:
+    #     - /var/run/docker.sock:/var/run/docker.sock
+    #   command: [..., --executor=docker]
+
+  worker-b:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+    command:
+      - atlas-worker
+      - --scheduler=scheduler:50051
+      - --id=worker-b
+      - --cpu=16
+      - --memory=8GB
+      - --labels=shape=compute
+    depends_on:
+      scheduler:
+        condition: service_healthy
+
+  worker-c:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+    command:
+      - atlas-worker
+      - --scheduler=scheduler:50051
+      - --id=worker-c
+      - --cpu=4
+      - --memory=64GB
+      - --labels=shape=memory
+    depends_on:
+      scheduler:
+        condition: service_healthy
+
+  prometheus:
+    image: prom/prometheus:v2.53.0
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+    depends_on:
+      scheduler:
+        condition: service_healthy
+
+volumes:
+  atlas-data:

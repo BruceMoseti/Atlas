@@ -1,0 +1,15 @@
+/bin/
+/dist/
+*.db
+*.db-wal
+*.db-shm
+/data/
+/tmp/
+
+# Chaos campaigns create a working directory per run, holding the database and
+# child process logs. The reports themselves are evidence and are committed.
+/results/chaos-*/
+
+# matplotlib/pip artifacts from the figure script
+__pycache__/
+*.pyc

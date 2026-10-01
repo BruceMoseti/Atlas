@@ -1,0 +1,89 @@
+groups:
+  - name: atlas
+    rules:
+      # Each of these corresponds to a specific entry in docs/FAILURE_MODEL.md.
+      # Metrics that nobody can alert on are decoration.
+
+      - alert: AtlasSchedulerDown
+        expr: up{job="atlas-scheduler"} == 0
+        for: 30s
+        labels: { severity: critical }
+        annotations:
+          summary: "Atlas control plane is unreachable"
+          description: >-
+            No scheduler means no submissions and no placements. Jobs already
+            running on workers keep running and are reconciled on restart, but
+            their leases will lapse if the outage outlasts the lease TTL.
+
+      - alert: AtlasNoHealthyWorkers
+        expr: atlas_workers_by_state{state="HEALTHY"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations:
+          summary: "No healthy workers in the fleet"
+          description: "Nothing can be placed. The queue will grow until admission control starts rejecting."
+
+      - alert: AtlasQueueGrowing
+        expr: atlas_queue_depth > 1000 and deriv(atlas_queue_depth[10m]) > 0
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Queue is deep and still growing"
+          description: >-
+            Arrival rate exceeds what the fleet can retain. Either the fleet is
+            too small or something is failing repeatedly. Depth alone is not
+            enough to alert on: a deep but shrinking queue is a burst draining
+            normally.
+
+      - alert: AtlasAdmissionRejecting
+        expr: rate(atlas_jobs_rejected_total[5m]) > 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Admission control is shedding load ({{ $labels.reason }})"
+          description: >-
+            Backpressure is working as designed, which also means callers are
+            being turned away. Check whether the cause is genuine overload or
+            a misconfigured limit.
+
+      - alert: AtlasLeaseExpirationsElevated
+        expr: rate(atlas_lease_expirations_total[5m]) > 0.2
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Leases are being reclaimed unusually often"
+          description: >-
+            Workers are dying, pausing, or failing to renew. Every reclamation
+            is a retry, and under at-least-once semantics possibly a duplicate
+            execution.
+
+      - alert: AtlasStaleAttemptRejections
+        expr: rate(atlas_stale_attempt_rejections_total[5m]) > 0.1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Workers are reporting on attempts they no longer own"
+          description: >-
+            Expected after a partition heals and harmless in itself — the
+            scheduler is refusing the writes. A sustained rate means leases are
+            being reclaimed from workers that are in fact still alive, which
+            usually means the lease TTL is too short for the network.
+
+      - alert: AtlasDuplicateExecutions
+        expr: increase(atlas_duplicate_executions_detected_total[1h]) > 0
+        labels: { severity: info }
+        annotations:
+          summary: "Observed duplicate execution of a job"
+          description: >-
+            A reclaimed attempt reported success afterwards, so a job really did
+            run more than once. This is permitted by at-least-once semantics and
+            is worth tracking rather than hiding. Confirm the affected workloads
+            are idempotent.
+
+      - alert: AtlasRecoverySlow
+        expr: histogram_quantile(0.99, rate(atlas_recovery_latency_seconds_bucket[10m])) > 60
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "p99 recovery from a lapsed lease exceeds 60s"
+          description: "The reconcile loop is falling behind, or the lease sweep limit is too low for the failure rate."

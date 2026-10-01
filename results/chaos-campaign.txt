@@ -1,0 +1,85 @@
+Atlas Chaos Report
+==================
+
+Environment
+  host                      cursor
+  go / os / arch            go1.22.2 linux/amd64
+  cpus                      8
+  started                   2026-10-01T03:41:53Z
+  wall clock                2m50s
+
+Configuration
+  workers                   10
+  jobs                      3000
+  job duration              1.5s
+  attempt budget            10
+  fault window              2m30s (mean interval 2s)
+  lease ttl                 4s
+  heartbeat suspect / dead  1.5s / 4s
+  duplicate rpc rate        0.20
+  heartbeat drop rate       0.10
+  lease renewal drop rate   0.05
+  seed                      1
+
+Faults injected
+  kill-worker               24
+  pause-worker              17
+  restart-scheduler         9
+
+Submission
+  submitted                 3000
+  accepted                  3000
+  rejected (admission)      0
+  failed to submit          0
+
+Outcome
+  jobs in store             3000
+  terminal                  3000
+  still pending             0
+  succeeded                 3000
+  failed after retry limit  0
+  canceled                  0
+
+Execution attempts
+  attempts total            3083
+  succeeded                 3000
+  failed                    0
+  lost (lease reclaimed)    83
+  canceled                  0
+  retries                   83
+  most attempts on one job  2
+  duplicate executions      16  (reclaimed attempts that later
+                                reported success: work that really did
+                                run twice, which at-least-once allows)
+
+Recovery latency (lease reclaimed to replacement attempt assigned)
+  p50                       64ms
+  p99                       159ms
+  max                       159ms
+  (excludes detection, which is bounded above by the 4s dead-after
+   threshold for a worker that stops heartbeating, and by the 4s lease
+   TTL for one that is alive but stops renewing)
+
+Invariants (docs/SEMANTICS.md §7), checked against 24484 audited state changes
+  I1  terminal states were never left                      held
+  I2  no worker was oversubscribed or went negative        held
+  I3  allocation equals the sum of live attempts           held
+  I4  at most one live attempt per job                     held
+  I5  attempt counts stayed within budget                  held
+  I6  every accepted job is still in the store             held
+  I7  idempotency keys are unique                          held
+  I8  no stale attempt decided a job's outcome             held
+  I9  job and attempt states agree                         held
+
+Drained within timeout      true
+
+VERDICT: PASS - every documented invariant held under fault injection
+
+What this does and does not show
+  Every number above comes from the SQLite database the run produced,
+  read after every process had exited. The attempt counts are physical
+  executions, not logical jobs: under at-least-once semantics a job that
+  was retried really did run more than once, and Atlas does not pretend
+  otherwise. What it does claim is that no accepted job disappeared, no
+  terminal state was ever revisited, no worker was oversubscribed, and no
+  stale attempt decided a job's outcome.

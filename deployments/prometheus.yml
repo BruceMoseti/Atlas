@@ -1,0 +1,11 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: atlas-scheduler
+    static_configs:
+      - targets: ["scheduler:9090"]
+
+rule_files:
+  - /etc/prometheus/alerts.yml

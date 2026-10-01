@@ -1,0 +1,32 @@
+Atlas simulator
+  run at       2026-10-01T03:22:13Z
+  host         cursor
+  go           go1.22.2
+  os/arch      linux/amd64
+  cpus         8
+  memory       47.1GiB
+
+Experiment 6 - priority aging versus starvation
+===============================================
+
+10 workers: 10 x uniform (16 cpu, 32GiB mem)
+workload: 20000 jobs, 70% at priority 100 and 30% at priority 0, arriving at 40/sec
+the cluster is deliberately undersized, so low-priority work only runs if the
+ordering lets it
+
+ORDERING                           CLASS   MEAN WAIT  P50 WAIT  P99 WAIT  MAX WAIT  CPU UTIL
+fifo (priority ignored)            urgent  6.4m       6.4m      12.6m     12.7m     98.8%
+fifo (priority ignored)            batch   6.4m       6.4m      12.6m     12.7m     98.8%
+strict priority                    urgent  3.2m       3.2m      6.3m      6.4m      98.6%
+strict priority                    batch   13.6m      13.7m     14.5m     14.5m     98.6%
+priority + aging (1/s, cap 1000)   urgent  5.2m       5.1m      11.4m     11.5m     98.6%
+priority + aging (1/s, cap 1000)   batch   9.1m       9.4m      13.1m     13.2m     98.6%
+priority + aging (10/s, cap 1000)  urgent  3.8m       3.9m      7.0m      7.0m      98.6%
+priority + aging (10/s, cap 1000)  batch   12.3m      13.5m     14.4m     14.4m     98.6%
+priority + aging (10/s, no cap)    urgent  6.3m       6.3m      12.5m     12.6m     98.6%
+priority + aging (10/s, no cap)    batch   6.7m       6.8m      12.8m     12.8m     98.6%
+
+The aggregate wait hides the whole story here, which is why the table is split
+by class. Read the gap between the urgent and batch rows: strict priority buys
+urgent work a shorter wait and charges batch work for it, and aging is the
+knob that decides how large that bill is allowed to get.

@@ -1,0 +1,31 @@
+Atlas simulator
+  run at       2026-10-01T03:21:51Z
+  host         cursor
+  go           go1.22.2
+  os/arch      linux/amd64
+  cpus         8
+  memory       47.1GiB
+
+Experiment 1 - placement policy versus offered load
+===================================================
+
+100 workers: 50 x general (16 cpu, 32GiB mem); 30 x compute (32 cpu, 16GiB mem); 20 x memory (8 cpu, 128GiB mem)
+classes: small 60% (0.5 cpu, 512MiB mem, runtime bimodal(short=5, long=60, p_long=0.05)); cpu-heavy 20% (4 cpu, 1GiB mem, runtime bimodal(short=20, long=180, p_long=0.1)); memory-heavy 15% (1 cpu, 12GiB mem, runtime bimodal(short=30, long=200, p_long=0.1)); large 5% (8 cpu, 16GiB mem, runtime exp(mean=120))
+estimated sustainable throughput: 22.3 jobs/sec
+workload: 20000 jobs per run, Poisson arrivals, seed 1
+
+LOAD  POLICY        MEAN WAIT  P50  P95     P99     CPU UTIL  MEM UTIL  STRANDED CPU  STRANDED MEM  QUEUE PEAK
+70%   round-robin   1.33s      0ms  386ms   49.00s  41.4%     36.5%     34.9%         42.4%         53
+70%   least-loaded  128ms      0ms  0ms     3.82s   41.4%     36.5%     29.7%         37.4%         24
+70%   best-fit      2.92s      0ms  22.09s  47.82s  41.1%     36.3%     33.7%         41.3%         212
+90%   round-robin   9.80s      0ms  6.97s   5.4m    46.6%     41.1%     35.3%         42.7%         347
+90%   least-loaded  2.18s      0ms  0ms     92.98s  46.9%     41.4%     22.1%         31.0%         119
+90%   best-fit      11.60s     0ms  82.21s  4.4m    46.9%     41.4%     32.0%         40.1%         568
+105%  round-robin   15.16s     0ms  33.23s  7.5m    46.5%     41.1%     35.5%         42.8%         588
+105%  least-loaded  5.36s      0ms  18.81s  3.1m    50.3%     44.4%     21.1%         30.2%         311
+105%  best-fit      14.51s     0ms  69.50s  6.0m    48.9%     43.1%     30.5%         38.6%         668
+
+Stranded capacity is the mean fraction of the fleet that sat free while at
+least one job was waiting for capacity, averaged over exactly that time. It
+is fragmentation made measurable: resources that existed, were idle, and
+still could not be used. Lower is better.

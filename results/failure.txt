@@ -1,0 +1,19 @@
+Atlas simulator
+  run at       2026-10-01T03:24:02Z
+  host         cursor
+  go           go1.22.2
+  os/arch      linux/amd64
+  cpus         8
+  memory       47.1GiB
+
+Experiment 2b - worker failure rate versus completion time
+==========================================================
+
+failures per worker per simulated hour; a failed worker loses everything it
+was running, and that work is not requeued until its lease would have expired
+
+FAILURES/WORKER/HR  FAILURES  LOST ATTEMPTS  RETRIES  COMPLETED  ABANDONED  MEAN TURNAROUND  P99 TURNAROUND
+0                   0         0              0        20000      0          3.5m             23.5m
+1                   1199      134            134      20000      0          4.1m             23.3m
+10                  10949     1471           1463     19992      8          5.9m             35.3m
+60                  48067     9605           8749     19144      856        7.0m             52.2m
