@@ -1,0 +1,362 @@
+syntax = "proto3";
+
+package atlas.v1;
+
+option go_package = "github.com/BruceMoseti/Atlas/proto/atlaspb;atlaspb";
+
+// Timestamps are Unix nanoseconds. Durations are seconds unless the field name says
+// otherwise. Atlas avoids the well-known types here so that the wire format stays
+// readable in `grpcurl` output and the generated code has no extra dependencies.
+
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_SUBMITTED = 1;
+  JOB_STATE_QUEUED = 2;
+  JOB_STATE_ASSIGNED = 3;
+  JOB_STATE_RUNNING = 4;
+  JOB_STATE_SUCCEEDED = 5;
+  JOB_STATE_FAILED = 6;
+  JOB_STATE_CANCELED = 7;
+}
+
+enum AttemptState {
+  ATTEMPT_STATE_UNSPECIFIED = 0;
+  ATTEMPT_STATE_ASSIGNED = 1;
+  ATTEMPT_STATE_RUNNING = 2;
+  ATTEMPT_STATE_SUCCEEDED = 3;
+  ATTEMPT_STATE_FAILED = 4;
+  // The scheduler does not know what happened: the lease expired or the worker
+  // was declared dead.
+  ATTEMPT_STATE_LOST = 5;
+  ATTEMPT_STATE_CANCELED = 6;
+}
+
+enum FailureClass {
+  FAILURE_CLASS_UNSPECIFIED = 0;
+  // The workload ran and exited non-zero.
+  FAILURE_CLASS_PROCESS_EXIT = 1;
+  // The workload exceeded its timeout.
+  FAILURE_CLASS_TIMEOUT = 2;
+  // Lease expired or the worker was declared dead.
+  FAILURE_CLASS_WORKER_LOST = 3;
+  // The worker could not obtain resources, or an image pull failed.
+  FAILURE_CLASS_RESOURCE_ERROR = 4;
+  FAILURE_CLASS_SYSTEM_ERROR = 5;
+  FAILURE_CLASS_CANCELED = 6;
+}
+
+enum WorkerState {
+  WORKER_STATE_UNSPECIFIED = 0;
+  WORKER_STATE_HEALTHY = 1;
+  WORKER_STATE_SUSPECT = 2;
+  WORKER_STATE_DEAD = 3;
+  WORKER_STATE_DRAINING = 4;
+  WORKER_STATE_DRAINED = 5;
+}
+
+message ResourceSpec {
+  // CPU in millicores: 1000 == one core.
+  int64 cpu_millis = 1;
+  int64 memory_bytes = 2;
+}
+
+// ---------------------------------------------------------------- client API
+
+message SubmitJobRequest {
+  // Deduplicates submission. If a job with this key already exists, the existing
+  // job is returned unchanged. If omitted, Atlas generates a key and the
+  // submission is NOT deduplicated.
+  string idempotency_key = 1;
+  string client_id = 2;
+
+  // Execution. Leave image empty to run the command directly as a process on the
+  // worker; set it to run inside a container.
+  string image = 3;
+  repeated string command = 4;
+  map<string, string> env = 5;
+
+  int64 cpu_millis = 6;
+  int64 memory_bytes = 7;
+
+  // Higher runs first. Effective priority also grows with queue wait time when
+  // the aging ordering is enabled on the scheduler.
+  int32 priority = 8;
+
+  int32 max_attempts = 9;
+  int64 timeout_seconds = 10;
+
+  // Optional absolute deadline, Unix nanoseconds. Only consulted by the EDF
+  // queue ordering.
+  int64 deadline_unix_nanos = 11;
+
+  // Retry overrides. Lost workers and system errors are always retried; these
+  // two classes are not retried by default because repeating them is usually
+  // just a slower way to get the same answer.
+  bool retry_on_process_exit = 12;
+  bool retry_on_timeout = 13;
+}
+
+message SubmitJobResponse {
+  string job_id = 1;
+  JobState state = 2;
+  int64 created_at_unix_nanos = 3;
+  // True when the idempotency key matched an existing job and nothing new was
+  // created.
+  bool deduplicated = 4;
+}
+
+message Attempt {
+  string attempt_id = 1;
+  string job_id = 2;
+  int32 attempt_number = 3;
+  string worker_id = 4;
+  AttemptState state = 5;
+  string lease_id = 6;
+  int64 lease_expires_at_unix_nanos = 7;
+  int64 created_at_unix_nanos = 8;
+  int64 started_at_unix_nanos = 9;
+  int64 finished_at_unix_nanos = 10;
+  int32 exit_code = 11;
+  bool has_exit_code = 12;
+  FailureClass failure_class = 13;
+  string message = 14;
+  string stdout_tail = 15;
+  string stderr_tail = 16;
+}
+
+message Job {
+  string job_id = 1;
+  string idempotency_key = 2;
+  string client_id = 3;
+  JobState state = 4;
+  int32 priority = 5;
+  ResourceSpec request = 6;
+  string image = 7;
+  repeated string command = 8;
+  int32 max_attempts = 9;
+  int32 attempt_count = 10;
+  int64 timeout_seconds = 11;
+  int64 created_at_unix_nanos = 12;
+  int64 updated_at_unix_nanos = 13;
+  int64 enqueued_at_unix_nanos = 14;
+  int64 eligible_at_unix_nanos = 15;
+  int64 deadline_unix_nanos = 16;
+  string current_attempt_id = 17;
+  int32 exit_code = 18;
+  bool has_exit_code = 19;
+  FailureClass failure_class = 20;
+  string message = 21;
+  repeated Attempt attempts = 22;
+}
+
+message GetJobRequest {
+  string job_id = 1;
+  bool include_attempts = 2;
+}
+
+message GetJobResponse { Job job = 1; }
+
+message ListJobsRequest {
+  repeated JobState states = 1;
+  string client_id = 2;
+  int32 limit = 3;
+  int32 offset = 4;
+}
+
+message ListJobsResponse { repeated Job jobs = 1; }
+
+message CancelJobRequest {
+  string job_id = 1;
+  string reason = 2;
+}
+
+message CancelJobResponse {
+  JobState state = 1;
+  // False when the job was already terminal, which is not an error.
+  bool canceled = 2;
+}
+
+message Worker {
+  string worker_id = 1;
+  string hostname = 2;
+  string version = 3;
+  map<string, string> labels = 4;
+  ResourceSpec capacity = 5;
+  ResourceSpec allocated = 6;
+  WorkerState state = 7;
+  int64 registered_at_unix_nanos = 8;
+  int64 last_heartbeat_at_unix_nanos = 9;
+  int64 generation = 10;
+  int32 running_attempts = 11;
+}
+
+message ListWorkersRequest {}
+message ListWorkersResponse { repeated Worker workers = 1; }
+
+message DrainWorkerRequest {
+  string worker_id = 1;
+  // Undrain returns a DRAINING or DRAINED worker to HEALTHY.
+  bool undrain = 2;
+}
+
+message DrainWorkerResponse { WorkerState state = 1; }
+
+message ClusterStatusRequest {}
+
+message ClusterStatusResponse {
+  int32 workers_total = 1;
+  int32 workers_healthy = 2;
+  ResourceSpec capacity = 3;
+  ResourceSpec allocated = 4;
+  int32 jobs_queued = 5;
+  int32 jobs_running = 6;
+  double cpu_utilization = 7;
+  double memory_utilization = 8;
+  string scheduling_policy = 9;
+  string queue_ordering = 10;
+}
+
+service AtlasService {
+  rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse);
+  rpc GetJob(GetJobRequest) returns (GetJobResponse);
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse);
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse);
+  rpc ListWorkers(ListWorkersRequest) returns (ListWorkersResponse);
+  rpc DrainWorker(DrainWorkerRequest) returns (DrainWorkerResponse);
+  rpc GetClusterStatus(ClusterStatusRequest) returns (ClusterStatusResponse);
+}
+
+// ---------------------------------------------------------------- worker API
+
+message RegisterWorkerRequest {
+  string worker_id = 1;
+  string hostname = 2;
+  string version = 3;
+  map<string, string> labels = 4;
+  ResourceSpec capacity = 5;
+}
+
+message RegisterWorkerResponse {
+  string worker_id = 1;
+  int64 generation = 2;
+  // How often the worker should heartbeat.
+  int64 heartbeat_interval_millis = 3;
+  // How often the worker should renew each active lease. Always comfortably
+  // shorter than the lease TTL.
+  int64 lease_renew_interval_millis = 4;
+  int64 lease_ttl_millis = 5;
+}
+
+message HeartbeatRequest {
+  string worker_id = 1;
+  int64 generation = 2;
+  // Attempt ids the worker believes it is executing. The scheduler compares this
+  // with its own view and tells the worker to kill anything it no longer owns.
+  repeated string active_attempt_ids = 3;
+}
+
+message HeartbeatResponse {
+  WorkerState state = 1;
+  // Attempts the worker must stop: their leases were reclaimed, they were
+  // canceled, or they belong to a previous generation of this worker.
+  repeated string cancel_attempt_ids = 2;
+  // True when the worker should stop calling AcquireJob.
+  bool draining = 3;
+  // Set when the scheduler has no record of this worker and it must register
+  // again, for instance after the scheduler's database was replaced.
+  bool must_reregister = 4;
+}
+
+message Assignment {
+  string job_id = 1;
+  string attempt_id = 2;
+  int32 attempt_number = 3;
+  string lease_id = 4;
+  int64 lease_expires_at_unix_nanos = 5;
+  string image = 6;
+  repeated string command = 7;
+  map<string, string> env = 8;
+  ResourceSpec request = 9;
+  int64 timeout_seconds = 10;
+}
+
+message AcquireJobRequest {
+  string worker_id = 1;
+  int64 generation = 2;
+  // Long-poll budget. The scheduler holds the call open for up to this long
+  // waiting for an assignment, which keeps dispatch latency low without
+  // requiring the scheduler to connect back to workers.
+  int64 wait_millis = 3;
+}
+
+message AcquireJobResponse {
+  // Empty when the long poll timed out with no work.
+  repeated Assignment assignments = 1;
+}
+
+// Every worker-originated mutation is scoped to one attempt and one lease. This is
+// what stops a resurrected worker from overwriting a newer attempt's result.
+message AttemptRef {
+  string job_id = 1;
+  string attempt_id = 2;
+  string lease_id = 3;
+  string worker_id = 4;
+}
+
+message StartJobRequest { AttemptRef ref = 1; }
+
+message StartJobResponse {
+  int64 lease_expires_at_unix_nanos = 1;
+  // True when the attempt was already RUNNING; the call is a safe no-op.
+  bool already_started = 2;
+}
+
+message RenewLeaseRequest { AttemptRef ref = 1; }
+
+message RenewLeaseResponse {
+  int64 lease_expires_at_unix_nanos = 1;
+  // True when the scheduler has canceled this attempt and the worker must kill
+  // the execution.
+  bool canceled = 2;
+}
+
+message CompleteJobRequest {
+  AttemptRef ref = 1;
+  int32 exit_code = 2;
+  string stdout_tail = 3;
+  string stderr_tail = 4;
+}
+
+message CompleteJobResponse {
+  JobState job_state = 1;
+  // True when this completion had already been recorded. The worker may safely
+  // retry CompleteJob after a lost response.
+  bool already_recorded = 2;
+}
+
+message FailJobRequest {
+  AttemptRef ref = 1;
+  FailureClass failure_class = 2;
+  string message = 3;
+  int32 exit_code = 4;
+  bool has_exit_code = 5;
+  string stdout_tail = 6;
+  string stderr_tail = 7;
+}
+
+message FailJobResponse {
+  JobState job_state = 1;
+  // True when the job was requeued for another attempt rather than failed.
+  bool will_retry = 2;
+  bool already_recorded = 3;
+}
+
+service WorkerService {
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc AcquireJob(AcquireJobRequest) returns (AcquireJobResponse);
+  rpc StartJob(StartJobRequest) returns (StartJobResponse);
+  rpc RenewLease(RenewLeaseRequest) returns (RenewLeaseResponse);
+  rpc CompleteJob(CompleteJobRequest) returns (CompleteJobResponse);
+  rpc FailJob(FailJobRequest) returns (FailJobResponse);
+}
