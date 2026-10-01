@@ -29,9 +29,11 @@ func TestWorkerDeathRecoversItsJobs(t *testing.T) {
 		c.startWorker(id, 2000, 2<<30)
 	}
 
-	// Each job occupies a full slot and runs long enough to still be in flight
-	// when the kill lands.
-	ids := c.submitN(30, []string{"sh", "-c", "sleep 0.4"}, 1000, 1<<30)
+	// Each job occupies a full slot. The duration matters: 6 slots and 30 jobs
+	// of 1s keep the cluster saturated for about 5 seconds, so the kill below
+	// is guaranteed to land on work that is actually running. At 0.4s the whole
+	// workload drained in under 2s and the kill could miss entirely.
+	ids := c.submitN(30, []string{"sh", "-c", "sleep 1"}, 1000, 1<<30)
 
 	waitUntilRunning(t, c, ids, 4, 15*time.Second)
 	c.killWorker("w1")
@@ -72,8 +74,10 @@ func TestKillingMostOfTheFleetStillCompletesEveryJob(t *testing.T) {
 		c.startWorker(id, 2000, 2<<30)
 	}
 
-	ids := c.submitN(60, []string{"sh", "-c", "sleep 0.3"}, 1000, 1<<30)
-	waitUntilRunning(t, c, ids, 6, 15*time.Second)
+	// 12 slots and 60 jobs of 1s: saturated for roughly 5 seconds, which is long
+	// enough for both kills below to hit live work.
+	ids := c.submitN(60, []string{"sh", "-c", "sleep 1"}, 1000, 1<<30)
+	waitUntilRunning(t, c, ids, 6, 20*time.Second)
 
 	for _, id := range []string{"w1", "w2"} {
 		c.killWorker(id)
@@ -106,8 +110,10 @@ func TestSchedulerRestartRecoversState(t *testing.T) {
 	finished := c.submitN(10, []string{"sh", "-c", "echo quick"}, 500, 512<<20)
 	c.waitForTerminal(finished, 60*time.Second)
 
-	inFlight := c.submitN(20, []string{"sh", "-c", "sleep 0.5"}, 1000, 1<<30)
-	waitUntilRunning(t, c, inFlight, 4, 15*time.Second)
+	// 8 slots and 20 jobs of 1s, so the crash below happens with work genuinely
+	// in flight rather than against an already-drained cluster.
+	inFlight := c.submitN(20, []string{"sh", "-c", "sleep 1"}, 1000, 1<<30)
+	waitUntilRunning(t, c, inFlight, 4, 20*time.Second)
 
 	// No graceful shutdown, no chance to flush anything that was not already
 	// durable. The workers keep running throughout.
@@ -702,26 +708,53 @@ func TestHeartbeatTellsWorkersToAbandonReclaimedWork(t *testing.T) {
 
 // --- helpers -----------------------------------------------------------------
 
-// waitUntilRunning blocks until at least n of the given jobs have been handed to a
-// worker. It reads each job's own state rather than a cluster gauge, so a test that
-// says "two jobs are in flight" is asserting on durable facts.
+// waitUntilRunning blocks until at least n of the given jobs are simultaneously in
+// flight on a worker.
+//
+// It asks once per poll, with a state filter, because this is a question about an
+// instant and the answer has to be a snapshot. Reading each job separately would
+// take one round trip per job, and on a loaded machine that sweep lasts longer than
+// a short job does — so it could count jobs that had already finished, miss ones
+// that started midway, and conclude that a busy cluster was idle. That is precisely
+// the flake this helper caused on a 2-vCPU CI runner while passing on an 8-core
+// development machine. ListJobs answers from a single read transaction, so what
+// comes back is one consistent moment.
 func waitUntilRunning(t *testing.T, c *cluster, ids []string, n int, timeout time.Duration) {
 	t.Helper()
+	wanted := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		wanted[id] = true
+	}
+
 	deadline := time.Now().Add(timeout)
+	best := 0
 	for time.Now().Before(deadline) {
+		res, err := c.client.ListJobs(context.Background(), &pb.ListJobsRequest{
+			States: []pb.JobState{
+				pb.JobState_JOB_STATE_ASSIGNED,
+				pb.JobState_JOB_STATE_RUNNING,
+			},
+			Limit: int32(len(ids) + 16),
+		})
+		if err != nil {
+			t.Fatalf("list jobs: %v", err)
+		}
 		live := 0
-		for _, id := range ids {
-			switch c.getJob(id).State {
-			case pb.JobState_JOB_STATE_ASSIGNED, pb.JobState_JOB_STATE_RUNNING:
+		for _, j := range res.Jobs {
+			if wanted[j.JobId] {
 				live++
 			}
 		}
 		if live >= n {
 			return
 		}
+		if live > best {
+			best = live
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("fewer than %d of %d jobs reached a worker within %s", n, len(ids), timeout)
+	t.Fatalf("wanted %d of %d jobs in flight at once within %s; the most ever seen at one instant was %d",
+		n, len(ids), timeout, best)
 }
 
 func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
