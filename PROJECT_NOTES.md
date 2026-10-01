@@ -95,7 +95,7 @@ CLI ──gRPC──▶ CONTROL PLANE (one atlas-server)
 | Simulator | `simulator/` | Discrete-event model reusing the real queue, policies, and resource model. |
 | Chaos harness | `chaos/` | Real child processes, real signals, campaign report, non-zero exit on violation. |
 
-13,628 lines of Go excluding generated protobuf, of which 3,788 are tests.
+13,770 lines of Go excluding generated protobuf, of which 3,885 are tests.
 
 ---
 
@@ -742,4 +742,86 @@ Answer directly; the willingness to say it is the point.
 | Queue pop | 159 ns at depth 100, 166 ns at depth 100,000 — flat |
 | Admission control | p99 wait flat at ~34 s across an 8× overload range, vs 18 minutes unbounded |
 | Tests | 107 total: 68 core unit + 11 simulator + 2 CLI + 26 integration. The 68 include 11 that make the invariant checker fail. All race-clean. |
-| Code | 13,628 lines of Go excluding generated protobuf; 3,788 of it tests |
+| Code | 13,770 lines of Go excluding generated protobuf; 3,885 of it tests |
+
+---
+
+## 13. Positioning material
+
+Kept here so the numbers in a CV and the numbers in the repository cannot drift
+apart. Everything below is verifiable from `results/`, the test suite, or the
+commit history.
+
+### Resume bullets
+
+> **Atlas — Fault-Tolerant Distributed Compute Scheduler** · Go, gRPC, Protocol
+> Buffers, SQLite, Docker, Prometheus
+>
+> - Built a distributed job scheduler with resource-aware placement, attempt-scoped
+>   leases, durable transactional state, and idempotent control-plane APIs;
+>   sustained **3,000/3,000 job completions through 50 injected faults** (worker
+>   `SIGKILL`/`SIGSTOP` and scheduler restarts) with **zero violations of nine
+>   formally specified invariants** across 24,484 audited state transitions.
+>
+> - Designed at-least-once execution semantics with two-stage failure detection and
+>   stale-attempt rejection, reducing recovery from a lost worker to a **p99 of
+>   159 ms**; built a mechanical invariant checker — itself tested against databases
+>   constructed to violate each property — and wired a randomized chaos campaign
+>   into CI as a correctness gate.
+>
+> - Engineered a discrete-event scheduling simulator over the production queue and
+>   placement code, benchmarking **10–10,000 workers and 20,000-job workloads**; the
+>   study found best-fit placement **7× worse than least-loaded** on heterogeneous
+>   fleets of identical total capacity, and quantified the O(workers) placement scan
+>   at **21 µs / 47k decisions per second** as justification for *not* optimizing it.
+
+### Shorter variant, two lines
+
+> - Built a fault-tolerant distributed compute scheduler in Go (gRPC, SQLite,
+>   Prometheus) with lease-based failure recovery and idempotent APIs; **3,000/3,000
+>   jobs survived 50 injected faults with zero invariant violations**, verified by a
+>   chaos campaign that runs in CI.
+> - Specified nine correctness invariants, built a checker that verifies them against
+>   the durable record, and benchmarked placement policies across **10–10,000
+>   simulated workers**, measuring a **4.5× queue-wait difference** between policies
+>   and a **7× fragmentation penalty** on heterogeneous fleets.
+
+### LinkedIn / portfolio description
+
+> **Atlas — Fault-Tolerant Distributed Compute Scheduler** (Go, gRPC, SQLite)
+>
+> A distributed scheduler that places resource-constrained jobs across a worker
+> fleet and keeps them running when machines, processes, and networks fail.
+>
+> The problem it takes seriously: a distributed system cannot tell the difference
+> between a worker that died before doing the work and a worker that died after
+> doing it. Atlas provides at-least-once execution with attempt-scoped leases,
+> idempotent control-plane operations, and stale-write rejection — then measures the
+> duplicate executions that result rather than claiming there are none.
+>
+> Correctness is specified rather than asserted: nine invariants are stated
+> formally, checked mechanically against the system's own durable record, and gated
+> in CI under randomized SIGKILL, SIGSTOP, scheduler restarts, and replayed RPCs. A
+> campaign injecting 50 faults completed 3,000 of 3,000 jobs with zero violations
+> across 24,484 audited state transitions.
+>
+> Also includes a discrete-event simulator over the real scheduling code, which
+> found that best-fit placement is 7× worse than least-loaded on heterogeneous
+> fleets of identical total capacity, and that an aging cap can silently restore the
+> priority starvation it was added to prevent.
+
+### The five things worth pointing at in a code review
+
+1. **`validateRef` in `internal/scheduler/worker_api.go`** — distinguishing a stale
+   write from an idempotent replay in one comparison, which is what makes
+   at-least-once safe to operate.
+2. **`internal/invariants` and its tests** — properties verified against the durable
+   record, with tests that construct each violation to prove the checker can fail.
+3. **`ReadyQueue` in `internal/scheduler/queue.go`** — a data structure chosen
+   because a heap cannot hold continuously-changing keys, with a measured flat pop
+   cost from depth 100 to 100,000.
+4. **`commitPlacements` in `internal/scheduler/dispatch.go`** — optimistic placement
+   against a cache, re-validated inside a batched transaction, so the cache can be
+   wrong without ever being dangerous.
+5. **`docs/RESULTS.md`** — the measured results, including the ones that are
+   unflattering and the eight limitations that bound them.

@@ -418,7 +418,8 @@ make build
 | `internal/worker` | 12 | Output capture, exit-code classification, timeouts, process-group kill, and the identifiers a workload needs to be idempotent |
 | `internal/types` | 5 | Resource arithmetic and the size/CPU parsers |
 | `simulator/` | 11 | Determinism for a seed, job conservation, no oversubscription inside the model, and that the failure path is actually wired up |
+| `cmd/atlas-cli` | 2 | CLI flag reordering, so a trailing `--reason` cannot be silently dropped |
 | `tests/` (integration) | 26 | Real gRPC, real SQLite, real worker processes: lifecycle, idempotency, cancellation, admission, draining, worker death, scheduler restart, stale attempts, forged leases, duplicate RPCs |
 
-All pass under `-race`. The integration suite takes about 33 seconds; with the race
-detector, about 42.
+**107 tests in total.** All pass under `-race`. The integration suite takes about
+33 seconds; with the race detector, about 42.
