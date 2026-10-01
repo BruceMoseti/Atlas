@@ -478,6 +478,17 @@ func (s *Scheduler) CompleteJob(ctx context.Context, ref AttemptRef, exitCode in
 		if a.StartedAt != nil {
 			runtime = now.Sub(*a.StartedAt)
 		}
+		// A completion can arrive without a preceding StartJob: the workload may
+		// have finished before that RPC landed, or the RPC may have been lost
+		// and the worker chose to run anyway. The execution did happen, so walk
+		// the attempt and the job through RUNNING rather than inventing a
+		// shortcut edge in the state machine.
+		if a.State == state.AttemptAssigned {
+			a.StartedAt = &now
+			if err := tx.TransitionAttempt(a, state.AttemptRunning, "implicit start on completion"); err != nil {
+				return err
+			}
+		}
 		if err := tx.FinishAttempt(a, state.AttemptSucceeded, "worker reported success"); err != nil {
 			return err
 		}
@@ -486,8 +497,6 @@ func (s *Scheduler) CompleteJob(ctx context.Context, ref AttemptRef, exitCode in
 		j.FailureClass = state.FailureNone
 		j.Message = ""
 		if j.State == state.JobAssigned {
-			// A job short enough to finish before StartJob landed skips
-			// RUNNING; walk it through so the state machine stays honest.
 			if err := tx.TransitionJob(j, state.JobRunning, "implicit start on completion"); err != nil {
 				return err
 			}

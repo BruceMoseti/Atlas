@@ -70,13 +70,13 @@ type QueuedJob struct {
 // It is not safe for concurrent use; the scheduler holds its own lock across every
 // call. Keeping the queue lock-free avoids a second lock ordering to reason about.
 //
-// The structure is a map of per-priority FIFO deques rather than one big heap, and
-// that choice is load-bearing. For FIFO, strict priority, and priority-with-aging,
-// the best job in a bucket is always the bucket's oldest job, because all three
-// orderings are monotone in wait time within a fixed base priority. So the global
-// best is found by comparing bucket heads, which is O(distinct priorities) and does
-// not depend on how many jobs are queued. Aging would otherwise mutate heap keys
-// under us.
+// The structure is a map of per-priority deques sorted by enqueue time rather than
+// one big heap, and that choice is load-bearing. For FIFO, strict priority, and
+// priority-with-aging, the best job in a bucket is always the bucket's oldest job,
+// because all three orderings are monotone in wait time within a fixed base
+// priority. So the global best is found by comparing bucket heads, which is
+// O(distinct priorities) and does not depend on how many jobs are queued. A heap
+// cannot do this, because aging changes every key continuously.
 //
 // Earliest-deadline-first breaks that monotonicity, so it gets a real heap.
 type ReadyQueue struct {
@@ -143,17 +143,31 @@ func (q *ReadyQueue) Push(j *QueuedJob) {
 	q.pushReady(j)
 }
 
+// pushReady inserts a job into its bucket, keeping the bucket sorted by enqueue
+// time. Sorted insertion is what makes "the bucket head is the bucket's best job"
+// true for every ordering that uses buckets, and the common case — a job enqueued
+// now, which is newer than everything already queued — is a single append.
+//
+// Out-of-order pushes are not hypothetical: recovery and the periodic resync load
+// rows from the database in whatever order the query returns them.
 func (q *ReadyQueue) pushReady(j *QueuedJob) {
 	if q.ordering == OrderEDF {
 		heap.Push(q.edf, j)
 		return
 	}
+	j.heapIndex = -1
 	b, ok := q.buckets[j.Priority]
 	if !ok {
 		b = list.New()
 		q.buckets[j.Priority] = b
 	}
-	j.elem = b.PushBack(j)
+	for e := b.Back(); e != nil; e = e.Prev() {
+		if !j.EnqueuedAt.Before(e.Value.(*QueuedJob).EnqueuedAt) {
+			j.elem = b.InsertAfter(j, e)
+			return
+		}
+	}
+	j.elem = b.PushFront(j)
 }
 
 // pushReadyFront returns a job to the head of its bucket, preserving the order it was
@@ -338,10 +352,10 @@ func (h *edfHeap) Pop() any {
 // delayHeap orders by eligibility time: the next job to come out of backoff is first.
 type delayHeap []*QueuedJob
 
-func (h delayHeap) Len() int            { return len(h) }
-func (h delayHeap) Less(i, j int) bool  { return h[i].EligibleAt.Before(h[j].EligibleAt) }
-func (h delayHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i]; h[i].heapIndex, h[j].heapIndex = i, j }
-func (h *delayHeap) Push(x any)         { j := x.(*QueuedJob); j.heapIndex = len(*h); *h = append(*h, j) }
+func (h delayHeap) Len() int           { return len(h) }
+func (h delayHeap) Less(i, j int) bool { return h[i].EligibleAt.Before(h[j].EligibleAt) }
+func (h delayHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i]; h[i].heapIndex, h[j].heapIndex = i, j }
+func (h *delayHeap) Push(x any)        { j := x.(*QueuedJob); j.heapIndex = len(*h); *h = append(*h, j) }
 func (h *delayHeap) Pop() any {
 	old := *h
 	n := len(old)
