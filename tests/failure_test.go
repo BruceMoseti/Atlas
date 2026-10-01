@@ -60,13 +60,7 @@ func TestWorkerDeathRecoversItsJobs(t *testing.T) {
 
 	// Capacity held by the dead worker must come back, or the cluster shrinks
 	// permanently every time a machine dies.
-	st, err := c.client.GetClusterStatus(context.Background(), &pb.ClusterStatusRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st.Allocated.CpuMillis != 0 {
-		t.Errorf("allocated cpu = %d once everything finished, want 0", st.Allocated.CpuMillis)
-	}
+	c.requireAllocationDrains(10 * time.Second)
 }
 
 // TestKillingMostOfTheFleetStillCompletesEveryJob pushes the same property harder:
@@ -179,13 +173,7 @@ func TestSchedulerRestartWithNoWorkersRequeuesEverything(t *testing.T) {
 
 	// Allocation from the dead incarnation must not still be booked, or the
 	// cluster permanently loses the capacity those jobs held.
-	st, err := c.client.GetClusterStatus(context.Background(), &pb.ClusterStatusRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st.Allocated.CpuMillis != 0 {
-		t.Errorf("allocated cpu = %d after recovery with no live attempts, want 0", st.Allocated.CpuMillis)
-	}
+	c.requireAllocationDrains(10 * time.Second)
 
 	// Bring a worker back; the requeued work must run.
 	c.startWorker("w2", 8000, 8<<30)

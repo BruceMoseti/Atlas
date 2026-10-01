@@ -332,6 +332,60 @@ func (c *cluster) waitForTerminal(ids []string, timeout time.Duration) map[strin
 	return nil
 }
 
+// requireAllocationDrains asserts that the cluster ends up reporting no reserved
+// capacity, and that the durable record agrees.
+//
+// The two halves are checked differently on purpose. The store is authoritative and
+// is correct the instant the releasing transaction commits, so it is checked once.
+// GetClusterStatus serves an in-memory cache that is updated just after that commit,
+// so it is polled. Closing that window would mean holding the scheduler's mutex
+// across a disk write, which would put fsync latency in the dispatcher's path — a
+// worse trade than a cache that converges in microseconds.
+//
+// Asserting on the cache without a wait is exactly the flake that showed up on a
+// loaded CI runner and not on a developer machine.
+func (c *cluster) requireAllocationDrains(timeout time.Duration) {
+	c.t.Helper()
+
+	// The durable side must already be right; there is no window here.
+	var leaked []string
+	if err := c.store.View(context.Background(), func(tx *store.Tx) error {
+		workers, err := tx.ListWorkers()
+		if err != nil {
+			return err
+		}
+		for _, w := range workers {
+			if w.Allocated.CPUMillis != 0 || w.Allocated.MemoryBytes != 0 {
+				leaked = append(leaked, fmt.Sprintf("%s cpu=%d mem=%d",
+					w.ID, w.Allocated.CPUMillis, w.Allocated.MemoryBytes))
+			}
+		}
+		return nil
+	}); err != nil {
+		c.t.Fatalf("read worker rows: %v", err)
+	}
+	if len(leaked) > 0 {
+		c.t.Errorf("the store still reserves capacity after everything finished: %v", leaked)
+	}
+
+	// The cached view must converge.
+	deadline := time.Now().Add(timeout)
+	var last *pb.ResourceSpec
+	for time.Now().Before(deadline) {
+		st, err := c.client.GetClusterStatus(context.Background(), &pb.ClusterStatusRequest{})
+		if err != nil {
+			c.t.Fatalf("cluster status: %v", err)
+		}
+		last = st.Allocated
+		if last.CpuMillis == 0 && last.MemoryBytes == 0 {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	c.t.Errorf("cluster status still reports cpu=%d mem=%d allocated after %s; the cached fleet view never converged",
+		last.CpuMillis, last.MemoryBytes, timeout)
+}
+
 // checkInvariants runs the full invariant suite and fails the test on any violation.
 func (c *cluster) checkInvariants(acceptedJobIDs []string) *invariants.Report {
 	c.t.Helper()

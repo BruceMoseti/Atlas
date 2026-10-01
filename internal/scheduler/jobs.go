@@ -280,13 +280,14 @@ func (s *Scheduler) CancelJob(ctx context.Context, id, reason string) (state.Job
 		reason = "canceled by client"
 	}
 	var (
-		final    state.JobState
-		canceled bool
-		workerID string
+		final       state.JobState
+		canceled    bool
+		workerID    string
+		freedWorker *types.Worker
 	)
 
 	err := s.store.Update(ctx, func(tx *store.Tx) error {
-		canceled = false
+		canceled, freedWorker = false, nil
 		j, err := tx.GetJob(id)
 		if err != nil {
 			return err
@@ -307,6 +308,7 @@ func (s *Scheduler) CancelJob(ctx context.Context, id, reason string) (state.Job
 				if err := tx.FinishAttempt(a, state.AttemptCanceled, reason); err != nil {
 					return err
 				}
+				freedWorker = workerAfterRelease(tx, a.WorkerID)
 			}
 		}
 
@@ -329,46 +331,16 @@ func (s *Scheduler) CancelJob(ctx context.Context, id, reason string) (state.Job
 	}
 
 	if canceled {
-		// Re-read the worker before taking the lock: the row changed when the
-		// attempt was canceled, and holding the scheduler mutex across a query
-		// would put database latency in the dispatcher's path.
-		fresh := s.loadWorker(ctx, workerID)
-
 		s.mu.Lock()
 		s.queue.Remove(id)
-		if ws, ok := s.workers[workerID]; ok {
-			if ws.view.Running > 0 {
-				ws.view.Running--
-			}
-			if fresh != nil {
-				s.syncWorkerLocked(fresh)
-			}
-		}
 		s.mu.Unlock()
+		// The transaction already released the attempt's capacity and handed
+		// back the row it wrote, so the cache update needs no further reads.
+		s.releaseWorkerSlot(workerID, freedWorker)
 		s.met.JobsCompleted.WithLabelValues(string(state.JobCanceled), string(state.FailureCanceled)).Inc()
 		s.met.AttemptsTotal.WithLabelValues(string(state.AttemptCanceled)).Inc()
 		s.log.Info("job_canceled", "job_id", id, "worker_id", workerID, "reason", reason)
 		s.signalDispatch()
 	}
 	return final, canceled, nil
-}
-
-// loadWorker reads one worker row, returning nil if it cannot. Callers use it to
-// refresh a cached view, and it deliberately does not take s.mu: no database query
-// should ever run while the scheduler mutex is held, because that mutex is also the
-// dispatcher's.
-func (s *Scheduler) loadWorker(ctx context.Context, id string) *types.Worker {
-	if id == "" {
-		return nil
-	}
-	var w *types.Worker
-	err := s.store.View(ctx, func(tx *store.Tx) error {
-		var err error
-		w, err = tx.GetWorker(id)
-		return err
-	})
-	if err != nil {
-		return nil
-	}
-	return w
 }

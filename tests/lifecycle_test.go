@@ -236,13 +236,7 @@ func TestCancelStopsARunningJob(t *testing.T) {
 	}
 
 	// Capacity must come back, or a cancel would leak the machine.
-	st, err := c.client.GetClusterStatus(context.Background(), &pb.ClusterStatusRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st.Allocated.CpuMillis != 0 {
-		t.Errorf("allocated cpu = %d after cancellation, want 0", st.Allocated.CpuMillis)
-	}
+	c.requireAllocationDrains(10 * time.Second)
 	c.checkInvariants([]string{res.JobId})
 }
 
@@ -279,14 +273,7 @@ func TestResourceAccountingIsReleasedOnCompletion(t *testing.T) {
 	ids := c.submitN(6, []string{"sh", "-c", "sleep 0.2"}, 1000, 1<<30)
 	c.waitForTerminal(ids, 60*time.Second)
 
-	st, err := c.client.GetClusterStatus(context.Background(), &pb.ClusterStatusRequest{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st.Allocated.CpuMillis != 0 || st.Allocated.MemoryBytes != 0 {
-		t.Errorf("allocation = cpu %d mem %d after everything finished, want zero",
-			st.Allocated.CpuMillis, st.Allocated.MemoryBytes)
-	}
+	c.requireAllocationDrains(10 * time.Second)
 	c.checkInvariants(ids)
 }
 

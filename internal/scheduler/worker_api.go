@@ -460,9 +460,10 @@ type CompleteResult struct {
 func (s *Scheduler) CompleteJob(ctx context.Context, ref AttemptRef, exitCode int32, stdoutTail, stderrTail string) (CompleteResult, error) {
 	var res CompleteResult
 	var runtime time.Duration
+	var freedWorker *types.Worker
 
 	err := s.store.Update(ctx, func(tx *store.Tx) error {
-		res, runtime = CompleteResult{}, 0
+		res, runtime, freedWorker = CompleteResult{}, 0, nil
 		j, a, replay, err := validateRef(tx, ref)
 		if err != nil {
 			return err
@@ -493,6 +494,9 @@ func (s *Scheduler) CompleteJob(ctx context.Context, ref AttemptRef, exitCode in
 		if err := tx.FinishAttempt(a, state.AttemptSucceeded, "worker reported success"); err != nil {
 			return err
 		}
+		// FinishAttempt released this worker's reservation. Capture the row it
+		// wrote so the cache can be updated without a second read.
+		freedWorker = workerAfterRelease(tx, a.WorkerID)
 
 		j.ExitCode = &exitCode
 		j.FailureClass = state.FailureNone
@@ -524,7 +528,7 @@ func (s *Scheduler) CompleteJob(ctx context.Context, ref AttemptRef, exitCode in
 		return res, nil
 	}
 
-	s.releaseWorkerSlot(ctx, ref.WorkerID)
+	s.releaseWorkerSlot(ref.WorkerID, freedWorker)
 	s.met.AttemptsTotal.WithLabelValues(string(state.AttemptSucceeded)).Inc()
 	s.met.JobsCompleted.WithLabelValues(string(state.JobSucceeded), "").Inc()
 	if runtime > 0 {
@@ -549,12 +553,13 @@ func (s *Scheduler) FailJob(ctx context.Context, ref AttemptRef, class state.Fai
 		class = state.FailureSystemError
 	}
 	var (
-		res      FailResult
-		requeued *types.Job
+		res         FailResult
+		requeued    *types.Job
+		freedWorker *types.Worker
 	)
 
 	err := s.store.Update(ctx, func(tx *store.Tx) error {
-		res, requeued = FailResult{}, nil
+		res, requeued, freedWorker = FailResult{}, nil, nil
 		j, a, replay, err := validateRef(tx, ref)
 		if err != nil {
 			return err
@@ -573,6 +578,7 @@ func (s *Scheduler) FailJob(ctx context.Context, ref AttemptRef, class state.Fai
 		if err := tx.FinishAttempt(a, state.AttemptFailed, message); err != nil {
 			return err
 		}
+		freedWorker = workerAfterRelease(tx, a.WorkerID)
 
 		again, err := s.disposeJobAfterAttempt(tx, j, a, class, message, exitCode)
 		if err != nil {
@@ -599,7 +605,7 @@ func (s *Scheduler) FailJob(ctx context.Context, ref AttemptRef, class state.Fai
 		s.queue.Push(queuedJobFrom(requeued))
 	}
 	s.mu.Unlock()
-	s.releaseWorkerSlot(ctx, ref.WorkerID)
+	s.releaseWorkerSlot(ref.WorkerID, freedWorker)
 
 	s.met.AttemptsTotal.WithLabelValues(string(state.AttemptFailed)).Inc()
 	s.log.Warn("attempt_failed",
@@ -608,15 +614,21 @@ func (s *Scheduler) FailJob(ctx context.Context, ref AttemptRef, class state.Fai
 	return res, nil
 }
 
-// releaseWorkerSlot refreshes a worker's cached view after one of its attempts
-// ended. The row is read before the lock is taken, so completion reports never put
-// database latency in the dispatcher's path.
-func (s *Scheduler) releaseWorkerSlot(ctx context.Context, workerID string) {
+// releaseWorkerSlot updates a worker's cached view after one of its attempts ended.
+//
+// The caller passes the worker row the transaction already wrote, rather than this
+// function re-reading it. Two reasons: a completion no longer costs a second
+// database round trip, and the window during which the cache still shows the freed
+// capacity shrinks to a mutex acquisition.
+//
+// That window cannot be closed entirely. Doing so would mean holding the scheduler
+// mutex across the commit, which would put disk latency in the dispatcher's path —
+// a worse trade. So GetClusterStatus is eventually consistent with the store by
+// design, and converges within one reconcile tick at the latest.
+func (s *Scheduler) releaseWorkerSlot(workerID string, fresh *types.Worker) {
 	if workerID == "" {
 		return
 	}
-	fresh := s.loadWorker(ctx, workerID)
-
 	s.mu.Lock()
 	if ws, ok := s.workers[workerID]; ok {
 		if ws.view.Running > 0 {
@@ -628,6 +640,21 @@ func (s *Scheduler) releaseWorkerSlot(ctx context.Context, workerID string) {
 	}
 	s.mu.Unlock()
 	s.signalDispatch()
+}
+
+// workerAfterRelease reads a worker row inside the transaction that just released
+// capacity on it, so the caller can hand the authoritative values straight to the
+// in-memory cache. A missing row is not an error: a purged worker has no cache
+// entry to update either.
+func workerAfterRelease(tx *store.Tx, workerID string) *types.Worker {
+	if workerID == "" {
+		return nil
+	}
+	w, err := tx.GetWorker(workerID)
+	if err != nil {
+		return nil
+	}
+	return w
 }
 
 // recordRefError counts and logs rejected worker RPCs.
